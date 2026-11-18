@@ -1,12 +1,8 @@
 import streamlit as st
 import pandas as pd
-from sqlalchemy import create_engine, text
-from urllib.parse import quote_plus
-from pathlib import Path
-
 
 # ---------------------------------------------------------
-# PAGE CONFIGURATION
+# PAGE CONFIG
 # ---------------------------------------------------------
 st.set_page_config(
     page_title="Lyfe Renewal App",
@@ -18,154 +14,303 @@ st.title("🩺 Lyfe Renewal App")
 
 
 # ---------------------------------------------------------
-# DATABASE CONNECTION
+# STEP 1: CSV UPLOAD
 # ---------------------------------------------------------
-@st.cache_resource
-def get_database_engine():
-
-    db_host = st.secrets["postgres"]["host"]
-    db_port = st.secrets["postgres"]["port"]
-    db_name = st.secrets["postgres"]["database"]
-    db_user = st.secrets["postgres"]["user"]
-    db_password = quote_plus(
-        st.secrets["postgres"]["password"]
-    )
-
-    connection_url = (
-        f"postgresql+psycopg2://"
-        f"{db_user}:{db_password}@"
-        f"{db_host}:{db_port}/"
-        f"{db_name}?sslmode=require"
-    )
-
-    return create_engine(
-        connection_url,
-        pool_pre_ping=True
-    )
-
-
-# ---------------------------------------------------------
-# STEP 1: RENEWAL MONTH SELECTION
-# ---------------------------------------------------------
-renewal_month = st.selectbox(
-    "Select Renewal Month",
-    [
-        "Jan 2026",
-        "Feb 2026",
-        "Mar 2026",
-        "Apr 2026",
-        "May 2026",
-        "Jun 2026",
-        "Jul 2026",
-        "Aug 2026",
-        "Sep 2026",
-        "Oct 2026",
-        "Nov 2026",
-        "Dec 2026"
-    ]
+uploaded_file = st.file_uploader(
+    "📂 Upload Patient CSV",
+    type=["csv"]
 )
 
 
-# Convert selected month into start and end dates
-month_start = pd.to_datetime(
-    renewal_month,
-    format="%b %Y"
-).date()
+if uploaded_file is not None:
 
-next_month_start = (
-    pd.Timestamp(month_start)
-    + pd.DateOffset(months=1)
-).date()
+    try:
+        # Load CSV
+        df = pd.read_csv(uploaded_file)
 
-
-# ---------------------------------------------------------
-# LOAD SQL FROM query.sql
-# ---------------------------------------------------------
-query_file = Path(__file__).parent / "query.sql"
-
-if not query_file.exists():
-    st.error("query.sql file GitHub repository mein nahi mili.")
-    st.stop()
-
-sql_query = query_file.read_text(encoding="utf-8")
-
-
-# ---------------------------------------------------------
-# LOAD SELECTED MONTH PATIENTS
-# ---------------------------------------------------------
-try:
-
-    engine = get_database_engine()
-
-    with st.spinner(
-        f"{renewal_month} renewal patients load ho rahe hain..."
-    ):
-
-        with engine.connect() as connection:
-
-            df = pd.read_sql_query(
-                text(sql_query),
-                connection,
-                params={
-                    "month_start": month_start,
-                    "next_month_start": next_month_start
-                }
+        # ---------------------------------------------------------
+        # CHECK SUBSCRIPTION END DATE COLUMN
+        # ---------------------------------------------------------
+        if "Subscription End Date" not in df.columns:
+            st.error(
+                "CSV mein `Subscription End Date` column nahi mila."
             )
 
-    st.success(
-        f"{len(df)} patients found whose plan ends in {renewal_month}"
-    )
+            st.write("Available columns:")
+            st.write(df.columns.tolist())
 
-    if df.empty:
+            st.stop()
 
-        st.warning(
-            f"{renewal_month} mein kisi patient ka plan end nahi ho raha."
+
+        # Convert to date
+        df["Subscription End Date"] = pd.to_datetime(
+            df["Subscription End Date"],
+            errors="coerce"
         )
 
-    else:
+        # Remove rows where date is invalid/missing
+        df = df[
+            df["Subscription End Date"].notna()
+        ].copy()
 
-        # Summary
-        col1, col2, col3 = st.columns(3)
+
+        # ---------------------------------------------------------
+        # CREATE MONTH-YEAR
+        # Example: Jan 2026
+        # ---------------------------------------------------------
+        df["Renewal Month"] = (
+            df["Subscription End Date"]
+            .dt.strftime("%b %Y")
+        )
+
+
+        # ---------------------------------------------------------
+        # MONTHS AVAILABLE IN CSV
+        # ---------------------------------------------------------
+        month_table = (
+            df[
+                ["Subscription End Date", "Renewal Month"]
+            ]
+            .drop_duplicates(subset=["Renewal Month"])
+            .sort_values("Subscription End Date")
+        )
+
+        month_options = (
+            month_table["Renewal Month"]
+            .tolist()
+        )
+
+
+        # ---------------------------------------------------------
+        # STEP 2: SELECT RENEWAL MONTH
+        # ---------------------------------------------------------
+        st.subheader("📅 Select Renewal Month")
+
+        selected_month = st.selectbox(
+            "Select Month",
+            month_options
+        )
+
+
+        # ---------------------------------------------------------
+        # FILTER SELECTED MONTH
+        # ---------------------------------------------------------
+        filtered_df = df[
+            df["Renewal Month"] == selected_month
+        ].copy()
+
+
+        # ---------------------------------------------------------
+        # HEADER
+        # ---------------------------------------------------------
+        st.success(
+            f"{len(filtered_df)} patients found whose plan ends in "
+            f"{selected_month}"
+        )
+
+
+        # ---------------------------------------------------------
+        # SUMMARY METRICS
+        # ---------------------------------------------------------
+        col1, col2, col3, col4 = st.columns(4)
 
         col1.metric(
             "Total Renewal Patients",
-            len(df)
+            len(filtered_df)
         )
 
-        if "Subscription End Date" in df.columns:
 
-            end_dates = pd.to_datetime(
-                df["Subscription End Date"],
+        # NPS Average
+        if "Latest NPS Score" in filtered_df.columns:
+
+            filtered_df["Latest NPS Score"] = pd.to_numeric(
+                filtered_df["Latest NPS Score"],
                 errors="coerce"
             )
 
+            avg_nps = filtered_df[
+                "Latest NPS Score"
+            ].mean()
+
             col2.metric(
-                "First Plan End Date",
-                end_dates.min().strftime("%d-%b-%Y")
-                if end_dates.notna().any()
+                "Average NPS",
+                round(avg_nps, 1)
+                if pd.notna(avg_nps)
                 else "-"
             )
+
+        else:
+            col2.metric(
+                "Average NPS",
+                "-"
+            )
+
+
+        # Promoters
+        if "Latest NPS Score" in filtered_df.columns:
+
+            promoters = (
+                filtered_df["Latest NPS Score"] >= 9
+            ).sum()
 
             col3.metric(
-                "Last Plan End Date",
-                end_dates.max().strftime("%d-%b-%Y")
-                if end_dates.notna().any()
-                else "-"
+                "NPS Promoters",
+                int(promoters)
             )
 
+        else:
+            col3.metric(
+                "NPS Promoters",
+                "-"
+            )
+
+
+        # Detractors
+        if "Latest NPS Score" in filtered_df.columns:
+
+            detractors = (
+                filtered_df["Latest NPS Score"] <= 6
+            ).sum()
+
+            col4.metric(
+                "NPS Detractors",
+                int(detractors)
+            )
+
+        else:
+            col4.metric(
+                "NPS Detractors",
+                "-"
+            )
+
+
+        # ---------------------------------------------------------
+        # NPS CATEGORY
+        # ---------------------------------------------------------
+        if "Latest NPS Score" in filtered_df.columns:
+
+            def nps_category(score):
+
+                if pd.isna(score):
+                    return "No NPS"
+
+                elif score >= 9:
+                    return "🟢 Promoter"
+
+                elif score >= 7:
+                    return "🟡 Passive"
+
+                else:
+                    return "🔴 Detractor"
+
+
+            filtered_df["NPS Category"] = (
+                filtered_df["Latest NPS Score"]
+                .apply(nps_category)
+            )
+
+
+        # ---------------------------------------------------------
+        # PATIENT TABLE
+        # ---------------------------------------------------------
+        st.divider()
+
         st.subheader(
-            f"📋 {renewal_month} Renewal Patients"
+            f"📋 {selected_month} Renewal Patients"
         )
 
+
+        display_columns = [
+            "Identifier",
+            "Patient Name",
+            "Subscription Start Date",
+            "Subscription End Date",
+            "Latest Engagement Status",
+            "HC Name",
+            "LCM Name",
+            "Latest NPS Score",
+            "NPS Category",
+            "Latest NPS Comments"
+        ]
+
+
+        available_columns = [
+            col
+            for col in display_columns
+            if col in filtered_df.columns
+        ]
+
+
         st.dataframe(
-            df,
+            filtered_df[available_columns],
             use_container_width=True,
             hide_index=True
         )
 
-except Exception as error:
 
-    st.error("Database se data load nahi hua.")
+        # ---------------------------------------------------------
+        # NPS DETAILS
+        # ---------------------------------------------------------
+        st.divider()
 
-    # Development ke time exact error dikhayega
-    st.exception(error)
+        st.subheader("⭐ NPS Details")
+
+
+        if "Latest NPS Score" in filtered_df.columns:
+
+            nps_columns = [
+                "Identifier",
+                "Patient Name",
+                "Latest NPS Score",
+                "NPS Category",
+                "Latest NPS Date",
+                "Latest NPS Comments",
+                "Overall Service Feedback",
+                "Health Coach Feedback",
+                "LCM Feedback",
+                "Cardio Therapy Feedback",
+                "Monitoring Devices Feedback",
+                "Lyfe App Feedback",
+                "Alert Management Feedback"
+            ]
+
+
+            available_nps_columns = [
+                col
+                for col in nps_columns
+                if col in filtered_df.columns
+            ]
+
+
+            nps_df = filtered_df[
+                available_nps_columns
+            ].copy()
+
+
+            st.dataframe(
+                nps_df,
+                use_container_width=True,
+                hide_index=True
+            )
+
+        else:
+
+            st.warning(
+                "`Latest NPS Score` column CSV mein nahi mila."
+            )
+
+
+    except Exception as e:
+
+        st.error(
+            "CSV process karte waqt error aaya."
+        )
+
+        st.exception(e)
+
+
+else:
+
+    st.info(
+        "👆 Patient CSV upload karein."
+    )
