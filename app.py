@@ -1,42 +1,36 @@
 import streamlit as st
+import pandas as pd
 
-st.sidebar.header("📅 Renewal Cohort")
+st.set_page_config(
+    page_title="Lyfe Renewal App",
+    page_icon="🩺",
+    layout="wide"
+)
 
+st.title("🩺 Lyfe Renewal App")
 
-if "Plan End Date" in df.columns:
-    df["Plan End Date"] = pd.to_datetime(
-        df["Plan End Date"],
-        errors="coerce"
-    )
+# ---------------------------------------------------------
+# STEP 1: SELECT RENEWAL MONTH
+# ---------------------------------------------------------
 
-    df["Renewal_Month"] = df["Plan End Date"].dt.strftime("%b %Y")
+st.subheader("Select Renewal Month")
 
-    available_months = (
-        df["Plan End Date"]
-        .dropna()
-        .dt.to_period("M")
-        .sort_values()
-        .unique()
-    )
-
-    month_options = [
-        month.strftime("%b %Y")
-        for month in available_months
+renewal_month = st.selectbox(
+    "Which month's renewal patients do you want to see?",
+    [
+        "Jan 2026",
+        "Feb 2026",
+        "Mar 2026",
+        "Apr 2026",
+        "May 2026",
+        "Jun 2026",
+        "Jul 2026",
+        "Aug 2026",
+        "Sep 2026",
+        "Oct 2026",
+        "Nov 2026",
+        "Dec 2026"
     ]
+)
 
-    selected_month = st.sidebar.selectbox(
-        "Select Renewal Month",
-        month_options
-    )
-
-    view_df = df[
-        df["Renewal_Month"] == selected_month
-    ].copy()
-
-    st.sidebar.success(
-        f"{len(view_df)} patients in {selected_month}"
-    )
-
-else:
-    st.error("`Plan End Date` column file mein nahi mila.")
-    st.stop()
+st.success(f"Selected Renewal Month: {renewal_month}")
