@@ -1,4 +1,7 @@
+import streamlit as st
+
 st.sidebar.header("📅 Renewal Cohort")
+
 
 if "Plan End Date" in df.columns:
     df["Plan End Date"] = pd.to_datetime(
