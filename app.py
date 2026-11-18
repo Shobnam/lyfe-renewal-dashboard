@@ -20,7 +20,7 @@ st.write(
 
 
 # =========================================================
-# 1. FILE UPLOAD
+# FILE UPLOAD
 # =========================================================
 uploaded_file = st.file_uploader(
     "📂 Upload Patient File (CSV or Excel)",
@@ -29,39 +29,124 @@ uploaded_file = st.file_uploader(
 
 
 if uploaded_file is None:
-    st.info("👆 CSV ya Excel patient file upload karein.")
+    st.info("👆 CSV ya Excel file upload karein.")
     st.stop()
 
 
 # =========================================================
-# 2. READ CSV / EXCEL
+# READ FILE
 # =========================================================
 try:
 
+    # -----------------------------------------------------
+    # CSV
+    # -----------------------------------------------------
     if uploaded_file.name.lower().endswith(".csv"):
 
-        df = pd.read_csv(
-            uploaded_file
-        )
+        df = pd.read_csv(uploaded_file)
 
+        selected_sheet = None
+
+
+    # -----------------------------------------------------
+    # EXCEL
+    # -----------------------------------------------------
     elif uploaded_file.name.lower().endswith(".xlsx"):
 
-        df = pd.read_excel(
+        excel_file = pd.ExcelFile(
             uploaded_file,
             engine="openpyxl"
         )
 
+        sheet_names = excel_file.sheet_names
+
+
+        # -----------------------------------------------
+        # TRY TO FIND SHEET WITH SUBSCRIPTION END DATE
+        # -----------------------------------------------
+        detected_sheet = None
+
+        for sheet in sheet_names:
+
+            try:
+
+                check_df = pd.read_excel(
+                    uploaded_file,
+                    sheet_name=sheet,
+                    engine="openpyxl",
+                    nrows=5
+                )
+
+                check_df.columns = (
+                    check_df.columns
+                    .astype(str)
+                    .str.strip()
+                )
+
+                if "Subscription End Date" in check_df.columns:
+                    detected_sheet = sheet
+                    break
+
+            except Exception:
+                continue
+
+
+        # -----------------------------------------------
+        # SELECT DEFAULT SHEET
+        # -----------------------------------------------
+        if detected_sheet is not None:
+            default_index = sheet_names.index(
+                detected_sheet
+            )
+        else:
+            default_index = 0
+
+
+        selected_sheet = st.selectbox(
+            "📄 Select Excel Sheet",
+            sheet_names,
+            index=default_index
+        )
+
+
+        # -----------------------------------------------
+        # READ SELECTED SHEET
+        # -----------------------------------------------
+        df = pd.read_excel(
+            uploaded_file,
+            sheet_name=selected_sheet,
+            engine="openpyxl"
+        )
+
+
     else:
 
-        st.error("Only CSV aur Excel (.xlsx) files supported hain.")
+        st.error(
+            "❌ Only CSV aur Excel (.xlsx) supported hain."
+        )
+
         st.stop()
 
 
 except Exception as e:
 
-    st.error("File read nahi ho paayi.")
+    st.error(
+        "❌ File read nahi ho paayi."
+    )
+
     st.exception(e)
+
     st.stop()
+
+
+# =========================================================
+# CLEAN COLUMN NAMES
+# =========================================================
+df.columns = (
+    df.columns
+    .astype(str)
+    .str.strip()
+)
 
 
 st.success(
@@ -69,24 +154,36 @@ st.success(
 )
 
 
-# =========================================================
-# 3. CLEAN COLUMN NAMES
-# =========================================================
-df.columns = df.columns.astype(str).str.strip()
-
-
-# =========================================================
-# 4. CHECK SUBSCRIPTION END DATE
-# =========================================================
-required_date_column = "Subscription End Date"
-
-if required_date_column not in df.columns:
-
-    st.error(
-        "❌ File mein `Subscription End Date` column nahi mila."
+if selected_sheet:
+    st.caption(
+        f"Excel Sheet: {selected_sheet}"
     )
 
-    st.write("File mein available columns:")
+
+# =========================================================
+# CHECK EMPTY FILE / SHEET
+# =========================================================
+if len(df.columns) == 0:
+
+    st.error(
+        "❌ Selected Excel sheet blank hai. "
+        "Please data wali sheet select karein."
+    )
+
+    st.stop()
+
+
+# =========================================================
+# CHECK REQUIRED COLUMN
+# =========================================================
+if "Subscription End Date" not in df.columns:
+
+    st.error(
+        "❌ Selected sheet/file mein "
+        "`Subscription End Date` column nahi mila."
+    )
+
+    st.write("### Available columns:")
 
     st.write(
         df.columns.tolist()
@@ -96,16 +193,23 @@ if required_date_column not in df.columns:
 
 
 # =========================================================
-# 5. CONVERT SUBSCRIPTION END DATE
+# DATE CLEANING
 # =========================================================
 df["Subscription End Date"] = pd.to_datetime(
     df["Subscription End Date"],
-    errors="coerce",
-    dayfirst=False
+    errors="coerce"
 )
 
 
-# Invalid / blank end dates remove
+if "Subscription Start Date" in df.columns:
+
+    df["Subscription Start Date"] = pd.to_datetime(
+        df["Subscription Start Date"],
+        errors="coerce"
+    )
+
+
+# Remove records without valid end date
 df = df[
     df["Subscription End Date"].notna()
 ].copy()
@@ -114,15 +218,14 @@ df = df[
 if df.empty:
 
     st.warning(
-        "File mein valid Subscription End Date available nahi hai."
+        "⚠️ Valid Subscription End Date wala koi record nahi mila."
     )
 
     st.stop()
 
 
 # =========================================================
-# 6. CREATE RENEWAL MONTH
-# Example: Jan 2026
+# CREATE RENEWAL MONTH
 # =========================================================
 df["Renewal Month"] = (
     df["Subscription End Date"]
@@ -130,31 +233,26 @@ df["Renewal Month"] = (
 )
 
 
+df["Renewal Month Sort"] = (
+    df["Subscription End Date"]
+    .dt.to_period("M")
+    .dt.to_timestamp()
+)
+
+
 # =========================================================
-# 7. CREATE MONTH LIST FROM ACTUAL FILE DATA
+# AVAILABLE MONTHS
 # =========================================================
 month_table = (
     df[
         [
-            "Subscription End Date",
-            "Renewal Month"
-        ]
-    ]
-    .assign(
-        Month_Start=lambda x:
-        x["Subscription End Date"]
-        .dt.to_period("M")
-        .dt.to_timestamp()
-    )
-    [
-        [
             "Renewal Month",
-            "Month_Start"
+            "Renewal Month Sort"
         ]
     ]
     .drop_duplicates()
     .sort_values(
-        "Month_Start"
+        "Renewal Month Sort"
     )
 )
 
@@ -165,17 +263,17 @@ month_options = (
 )
 
 
-if not month_options:
+if len(month_options) == 0:
 
     st.warning(
-        "Renewal month available nahi hai."
+        "⚠️ Renewal month available nahi hai."
     )
 
     st.stop()
 
 
 # =========================================================
-# 8. SELECT RENEWAL MONTH
+# MONTH SELECTION
 # =========================================================
 st.divider()
 
@@ -189,7 +287,7 @@ selected_month = st.selectbox(
 
 
 # =========================================================
-# 9. FILTER SELECTED MONTH
+# FILTER SELECTED MONTH
 # =========================================================
 filtered_df = df[
     df["Renewal Month"] == selected_month
@@ -197,9 +295,12 @@ filtered_df = df[
 
 
 # =========================================================
-# 10. NPS CLEANING
+# NPS PROCESSING
 # =========================================================
-if "Latest NPS Score" in filtered_df.columns:
+has_nps = "Latest NPS Score" in filtered_df.columns
+
+
+if has_nps:
 
     filtered_df["Latest NPS Score"] = pd.to_numeric(
         filtered_df["Latest NPS Score"],
@@ -207,15 +308,12 @@ if "Latest NPS Score" in filtered_df.columns:
     )
 
 
-    # -----------------------------------------------------
-    # NPS CATEGORY
-    # -----------------------------------------------------
-    def get_nps_category(score):
+    def nps_category(score):
 
         if pd.isna(score):
             return "No NPS"
 
-        if score >= 9:
+        elif score >= 9:
             return "🟢 Promoter"
 
         elif score >= 7:
@@ -227,12 +325,12 @@ if "Latest NPS Score" in filtered_df.columns:
 
     filtered_df["NPS Category"] = (
         filtered_df["Latest NPS Score"]
-        .apply(get_nps_category)
+        .apply(nps_category)
     )
 
 
 # =========================================================
-# 11. SELECTED MONTH SUMMARY
+# SUMMARY
 # =========================================================
 st.success(
     f"✅ {len(filtered_df)} patients found whose plan ends in "
@@ -256,59 +354,74 @@ col1.metric(
 
 
 # =========================================================
-# NPS KPI
+# NPS KPIs
 # =========================================================
-if "Latest NPS Score" in filtered_df.columns:
+if has_nps:
 
     valid_nps = filtered_df[
         filtered_df["Latest NPS Score"].notna()
     ].copy()
 
 
-    # Average
-    avg_nps = (
-        valid_nps["Latest NPS Score"].mean()
-        if not valid_nps.empty
-        else None
-    )
+    if not valid_nps.empty:
+
+        average_nps = (
+            valid_nps[
+                "Latest NPS Score"
+            ].mean()
+        )
+
+        promoters = (
+            valid_nps[
+                "Latest NPS Score"
+            ] >= 9
+        ).sum()
+
+        detractors = (
+            valid_nps[
+                "Latest NPS Score"
+            ] <= 6
+        ).sum()
 
 
-    col2.metric(
-        "Average NPS",
-        round(avg_nps, 1)
-        if pd.notna(avg_nps)
-        else "-"
-    )
+        col2.metric(
+            "⭐ Average NPS",
+            round(average_nps, 1)
+        )
+
+        col3.metric(
+            "🟢 Promoters",
+            int(promoters)
+        )
+
+        col4.metric(
+            "🔴 Detractors",
+            int(detractors)
+        )
 
 
-    # Promoters 9-10
-    promoters = (
-        valid_nps["Latest NPS Score"] >= 9
-    ).sum()
+    else:
 
+        col2.metric(
+            "⭐ Average NPS",
+            "-"
+        )
 
-    col3.metric(
-        "🟢 Promoters",
-        int(promoters)
-    )
+        col3.metric(
+            "🟢 Promoters",
+            0
+        )
 
-
-    # Detractors 0-6
-    detractors = (
-        valid_nps["Latest NPS Score"] <= 6
-    ).sum()
-
-
-    col4.metric(
-        "🔴 Detractors",
-        int(detractors)
-    )
+        col4.metric(
+            "🔴 Detractors",
+            0
+        )
 
 
 else:
 
     col2.metric(
-        "Average NPS",
+        "⭐ Average NPS",
         "-"
     )
 
@@ -324,7 +437,7 @@ else:
 
 
 # =========================================================
-# 12. RENEWAL PATIENT TABLE
+# PATIENT TABLE
 # =========================================================
 st.divider()
 
@@ -334,11 +447,13 @@ st.subheader(
 
 
 patient_columns = [
+    "Patient ID",
     "Identifier",
     "Patient Name",
     "Email",
     "Subscription Start Date",
     "Subscription End Date",
+    "Days Remaining",
     "Latest Engagement Status",
     "HC Name",
     "LCM Name",
@@ -357,34 +472,40 @@ available_patient_columns = [
 
 if available_patient_columns:
 
-    st.dataframe(
-        filtered_df[
-            available_patient_columns
-        ].sort_values(
-            "Subscription End Date"
-        ),
-        use_container_width=True,
-        hide_index=True
-    )
+    display_df = filtered_df[
+        available_patient_columns
+    ].copy()
 
 else:
 
-    st.dataframe(
-        filtered_df,
-        use_container_width=True,
-        hide_index=True
-    )
+    display_df = filtered_df.drop(
+        columns=["Renewal Month Sort"],
+        errors="ignore"
+    ).copy()
+
+
+display_df = display_df.sort_values(
+    "Subscription End Date",
+    ascending=True
+)
+
+
+st.dataframe(
+    display_df,
+    use_container_width=True,
+    hide_index=True
+)
 
 
 # =========================================================
-# 13. NPS DETAILS
+# NPS DETAILS
 # =========================================================
-st.divider()
+if has_nps:
 
-st.subheader("⭐ NPS Details")
+    st.divider()
 
+    st.subheader("⭐ NPS Details")
 
-if "Latest NPS Score" in filtered_df.columns:
 
     nps_columns = [
         "Identifier",
@@ -430,27 +551,30 @@ if "Latest NPS Score" in filtered_df.columns:
 
 else:
 
-    st.warning(
-        "`Latest NPS Score` column uploaded file mein nahi mila."
+    st.info(
+        "ℹ️ Uploaded file mein `Latest NPS Score` nahi hai. "
+        "Renewal month filtering phir bhi properly work karega."
     )
 
 
 # =========================================================
-# 14. DOWNLOAD SELECTED MONTH PATIENTS
+# DOWNLOAD SELECTED MONTH
 # =========================================================
 st.divider()
 
 
-download_csv = (
-    filtered_df
-    .to_csv(
-        index=False
-    )
-    .encode("utf-8")
+download_df = filtered_df.drop(
+    columns=["Renewal Month Sort"],
+    errors="ignore"
 )
 
 
-safe_month_name = (
+csv_data = download_df.to_csv(
+    index=False
+).encode("utf-8")
+
+
+safe_month = (
     selected_month
     .replace(" ", "_")
     .lower()
@@ -458,8 +582,8 @@ safe_month_name = (
 
 
 st.download_button(
-    label=f"📥 Download {selected_month} Patient List",
-    data=download_csv,
-    file_name=f"{safe_month_name}_renewal_patients.csv",
+    label=f"📥 Download {selected_month} Patients",
+    data=csv_data,
+    file_name=f"{safe_month}_renewal_patients.csv",
     mime="text/csv"
 )
