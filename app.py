@@ -78,11 +78,18 @@ def first_numeric(df, names, default=np.nan):
 
 
 def service_component(df, scheduled, completed, pct, target):
-    sch = nseries(df, scheduled, 0).fillna(0)
-    comp = nseries(df, completed, 0).fillna(0)
-    rate = nseries(df, pct)
-    rate = rate.fillna(np.where(sch > 0, comp / sch * 100, np.nan))
-    effort = (comp / target).clip(0, 1) * 100
+    sch = nseries(df, scheduled, 0).fillna(0).astype(float)
+    comp = nseries(df, completed, 0).fillna(0).astype(float)
+    rate = nseries(df, pct).astype(float)
+
+    calculated_rate = pd.Series(
+        np.where(sch > 0, (comp / sch) * 100, np.nan),
+        index=df.index,
+        dtype=float
+    )
+
+    rate = rate.fillna(calculated_rate)
+    effort = (comp / float(target)).clip(0, 1) * 100
     score = rate.clip(0, 100) * 0.70 + effort * 0.30
     return score.where(sch > 0)
 
