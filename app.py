@@ -86,7 +86,7 @@ if (
 
 
 @st.cache_data(show_spinner=False)
-def read_workbook(file_bytes: bytes) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, List[str]]:
+def read_workbook(file_bytes: bytes) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, List[str]]:
     """Read scoring sheets and automatically find an optional reason-response sheet.
 
     A reason sheet is recognized when it contains Patient Id/Patient ID/Identifier
@@ -101,6 +101,17 @@ def read_workbook(file_bytes: bytes) -> Tuple[pd.DataFrame, pd.DataFrame, pd.Dat
     current = pd.read_excel(xls, sheet_name=CURRENT_SHEET)
     history = pd.read_excel(xls, sheet_name=HISTORY_SHEET)
     reason_data = pd.DataFrame()
+    escalation_whatsapp = pd.DataFrame()
+    escalation_mail = pd.DataFrame()
+
+    # Read both escalation sheets without changing renewal scoring logic.
+    sheet_lookup = {str(name).strip().lower(): name for name in xls.sheet_names}
+    whatsapp_sheet = sheet_lookup.get("escalation whatsapp")
+    mail_sheet = sheet_lookup.get("escalation mail")
+    if whatsapp_sheet:
+        escalation_whatsapp = pd.read_excel(xls, sheet_name=whatsapp_sheet)
+    if mail_sheet:
+        escalation_mail = pd.read_excel(xls, sheet_name=mail_sheet)
 
     patient_aliases = {"patient id", "patientid", "identifier", "patient identifier"}
     reason_aliases = {"primary reason", "primary reason for non-renewal", "reason", "renewal reason"}
@@ -113,7 +124,7 @@ def read_workbook(file_bytes: bytes) -> Tuple[pd.DataFrame, pd.DataFrame, pd.Dat
             reason_data = candidate
             break
 
-    return current, history, reason_data, xls.sheet_names
+    return current, history, reason_data, escalation_whatsapp, escalation_mail, xls.sheet_names
 
 
 if st.session_state.uploaded_excel_bytes is None:
@@ -123,7 +134,7 @@ if st.session_state.uploaded_excel_bytes is None:
         key="renewal_excel_uploader",
     )
     if uploaded is None:
-        st.info(f"Required tabs: `{CURRENT_SHEET}` and `{HISTORY_SHEET}`. File next calendar day automatically remove ho jayegi.")
+        st.info(f"Required tabs: `{CURRENT_SHEET}` and `{HISTORY_SHEET}`. Optional tabs: `Reasons`, `Escalation Whatsapp`, `Escalation Mail`. File next calendar day automatically remove ho jayegi.")
         st.stop()
     st.session_state.uploaded_excel_bytes = uploaded.getvalue()
     st.session_state.uploaded_excel_name = uploaded.name
@@ -143,7 +154,7 @@ else:
         st.rerun()
 
 try:
-    current, history, reason_data, sheet_names = read_workbook(st.session_state.uploaded_excel_bytes)
+    current, history, reason_data, escalation_whatsapp, escalation_mail, sheet_names = read_workbook(st.session_state.uploaded_excel_bytes)
 except Exception as exc:
     st.error("Excel read nahi hua.")
     st.exception(exc)
@@ -201,6 +212,67 @@ def prepare_reason_data(reason_df: pd.DataFrame) -> pd.DataFrame:
     out = out.sort_values("Reason Completion Time", na_position="first")
     out = out.drop_duplicates("_Patient_Key", keep="last")
     return out
+
+
+def excel_or_text_date(series: pd.Series) -> pd.Series:
+    """Convert Excel serial dates or normal date text to pandas dates."""
+    numeric = pd.to_numeric(series, errors="coerce")
+    from_serial = pd.to_datetime(numeric, unit="D", origin="1899-12-30", errors="coerce")
+    from_text = pd.to_datetime(series, errors="coerce")
+    return from_text.fillna(from_serial)
+
+
+def prepare_escalation_data(df: pd.DataFrame, source: str) -> pd.DataFrame:
+    """Standardize an escalation sheet while preserving every matching row."""
+    output_cols = [
+        "_Patient_Key", "Source", "Escalation Date", "Owner", "Team", "Bucket",
+        "Sub-Bucket", "Issue Type", "Type Of Issue", "Findings", "Ops Analysis",
+        "Escalation Raised By", "Action Status", "Status", "LCM", "HC",
+    ]
+    if df.empty:
+        return pd.DataFrame(columns=output_cols)
+
+    work = clean_df(df)
+    lower_map = {str(col).strip().lower(): col for col in work.columns}
+
+    def pick(*aliases):
+        for alias in aliases:
+            if alias.lower() in lower_map:
+                return lower_map[alias.lower()]
+        return None
+
+    patient_col = pick("Patient Id", "Patient ID", "Identifier", "Patient Identifier")
+    if not patient_col:
+        return pd.DataFrame(columns=output_cols)
+
+    result = pd.DataFrame(index=work.index)
+    result["_Patient_Key"] = normalize_identifier(work[patient_col])
+    result["Source"] = source
+
+    date_col = pick("Esc_Date", "Esc Date", "Escalation Date", "Date")
+    result["Escalation Date"] = excel_or_text_date(work[date_col]) if date_col else pd.NaT
+
+    mapping = {
+        "Owner": ("Owner",),
+        "Team": ("Team",),
+        "Bucket": ("Bucket",),
+        "Sub-Bucket": ("Sub-Bucket", "Sub Bucket", "SubBucket"),
+        "Issue Type": ("Issue Type",),
+        "Type Of Issue": ("Type Of Issue", "Type of issue"),
+        "Findings": ("Findings", "Finding"),
+        "Ops Analysis": ("Ops Analysis", "Ops Analy", "Ops Analy:"),
+        "Escalation Raised By": ("Escalation raised by", "Escalation Raised By"),
+        "Action Status": ("Action Status",),
+        "Status": ("Status",),
+        "LCM": ("LCM",),
+        "HC": ("HC",),
+    }
+    for target, aliases in mapping.items():
+        source_col = pick(*aliases)
+        result[target] = work[source_col].fillna("").astype(str).str.strip() if source_col else ""
+
+    result = result[result["_Patient_Key"].ne("")].copy()
+    return result[output_cols]
 
 
 def numeric_series(df: pd.DataFrame, col: str, default=np.nan) -> pd.Series:
@@ -519,6 +591,11 @@ def to_excel_bytes(df, model):
 # ---------------- Clean and score ----------------
 current, history = clean_df(current), clean_df(history)
 reason_lookup = prepare_reason_data(reason_data)
+escalation_whatsapp_view = prepare_escalation_data(escalation_whatsapp, "WhatsApp")
+escalation_mail_view = prepare_escalation_data(escalation_mail, "Mail")
+all_escalations = pd.concat(
+    [escalation_whatsapp_view, escalation_mail_view], ignore_index=True
+)
 if current.empty or history.empty:
     st.error("Current ya Historical sheet empty hai.")
     st.stop()
@@ -800,6 +877,42 @@ with tab3:
                     pd.DataFrame({"Field": cols, "Value": [row.get(x, "") for x in cols]}),
                     use_container_width=True,
                     hide_index=True,
+                )
+
+
+        # Additional escalation context. Existing renewal drill-down remains unchanged.
+        selected_key = normalize_identifier(pd.Series([row.get("Identifier", "")])).iloc[0]
+        patient_escalations = all_escalations[
+            all_escalations["_Patient_Key"].eq(selected_key)
+        ].copy()
+
+        escalation_display_cols = [
+            "Source", "Escalation Date", "Owner", "Team", "Bucket", "Sub-Bucket",
+            "Issue Type", "Type Of Issue", "Findings", "Ops Analysis",
+            "Escalation Raised By", "Action Status", "Status", "LCM", "HC",
+        ]
+        if not patient_escalations.empty:
+            patient_escalations["Escalation Date"] = pd.to_datetime(
+                patient_escalations["Escalation Date"], errors="coerce"
+            ).dt.strftime("%d-%b-%Y").fillna("")
+
+        with st.expander(
+            f"🚨 Escalations ({len(patient_escalations)})",
+            expanded=not patient_escalations.empty,
+        ):
+            if patient_escalations.empty:
+                st.info("Selected patient ke liye Escalation Whatsapp ya Escalation Mail record nahi mila.")
+            else:
+                visible_escalation_cols = [
+                    col for col in escalation_display_cols
+                    if col in patient_escalations.columns
+                    and patient_escalations[col].fillna("").astype(str).str.strip().ne("").any()
+                ]
+                st.dataframe(
+                    patient_escalations[visible_escalation_cols],
+                    use_container_width=True,
+                    hide_index=True,
+                    height=min(420, 80 + len(patient_escalations) * 45),
                 )
 
 with tab4:
