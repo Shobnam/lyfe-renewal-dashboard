@@ -582,21 +582,30 @@ scored["_Patient_Key"] = normalize_identifier(
 scored = scored.merge(reason_lookup, on="_Patient_Key", how="left")
 for col in ["Reason", "Reason Comment"]:
     scored[col] = scored[col].fillna("").astype(str).str.strip()
-# Count completed renewal calls from the three renewal-call status fields.
+# System Renewal Calls Completed is the authoritative renewal-call count.
+# Example: P61578 has System Renewal Calls Completed = 3, so the patient must
+# enter Reason Pending when not renewed and no non-renewal reason is available.
+system_completed = first_numeric(
+    scored,
+    ["System Renewal Calls Completed", "Renewal Calls Completed"],
+)
+
+# Fallback to the individual call-status fields only when the system count is missing.
 completed_status_cols = [
     c for c in ["Renewal Call 1 Status", "Renewal Call 2 Status", "Renewal Call 3 Status"]
     if c in scored.columns
 ]
 if completed_status_cols:
-    scored["Renewal Calls Completed Count"] = sum(
+    status_completed = sum(
         scored[c].fillna("").astype(str).str.strip().str.upper().eq("COMPLETED").astype(int)
         for c in completed_status_cols
     )
 else:
-    # Fallback only when the three status columns are unavailable.
-    scored["Renewal Calls Completed Count"] = first_numeric(
-        scored, ["Renewal Calls Completed", "System Renewal Calls Completed"], 0
-    ).fillna(0).astype(int)
+    status_completed = pd.Series(0, index=scored.index, dtype=int)
+
+scored["Renewal Calls Completed Count"] = (
+    system_completed.fillna(status_completed).fillna(0).astype(int)
+)
 
 not_renewed = pd.Series(True, index=scored.index)
 if "Renewal Status" in scored.columns:
