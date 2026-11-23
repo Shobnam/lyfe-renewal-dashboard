@@ -1,6 +1,11 @@
 import io
-from datetime import date
+import smtplib
+from datetime import date, datetime
 from typing import List, Tuple
+from email.mime.application import MIMEApplication
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.utils import formataddr, parseaddr
 
 import numpy as np
 import pandas as pd
@@ -47,6 +52,13 @@ REGULARIZATION = 0.01
 MANUAL_FINAL_WEIGHT = 0.50
 LOGISTIC_FINAL_WEIGHT = 0.50
 HIGH_VITALS_MIN = 10
+
+# SendGrid report settings
+SMTP_SERVER = "smtp.sendgrid.net"
+SMTP_PORT = 587
+DEFAULT_REPORT_SENDER = "shobnambegum@lupindigitalhealth.com"
+DEFAULT_REPORT_RECIPIENTS = "operationsteam@lupindigitalhealth.com"
+DEFAULT_REPORT_BCC = "shobnambegum@lupindigitalhealth.com"
 
 DATE_COLUMNS = [
     "Subscription Start Date", "Subscription End Date", "Actual Renewal Date",
@@ -588,6 +600,125 @@ def to_excel_bytes(df, model):
         ws.auto_filter.ref = ws.dimensions
     return output.getvalue()
 
+def is_valid_email(email_address: str) -> bool:
+    parsed = parseaddr(str(email_address or "").strip())[1]
+    return bool(parsed and "@" in parsed and "." in parsed.split("@")[-1])
+
+
+def parse_email_list(value: str) -> List[str]:
+    values = str(value or "").replace(";", ",").split(",")
+    return list(dict.fromkeys([x.strip() for x in values if is_valid_email(x.strip())]))
+
+
+def connect_sendgrid(api_key: str):
+    server = smtplib.SMTP(SMTP_SERVER, SMTP_PORT, timeout=60)
+    server.ehlo()
+    server.starttls()
+    server.ehlo()
+    server.login("apikey", api_key.strip())
+    return server
+
+
+def renewal_report_excel(call_df: pd.DataFrame, pending_df: pd.DataFrame, received_df: pd.DataFrame) -> bytes:
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        call_df.drop(columns=["_Patient_Key"], errors="ignore").to_excel(
+            writer, sheet_name="Renewal_Call_List", index=False
+        )
+        pending_df.drop(columns=["_Patient_Key"], errors="ignore").to_excel(
+            writer, sheet_name="Reason_Pending", index=False
+        )
+        received_df.drop(columns=["_Patient_Key"], errors="ignore").to_excel(
+            writer, sheet_name="Reason_Received", index=False
+        )
+        for ws in writer.book.worksheets:
+            ws.freeze_panes = "A2"
+            ws.auto_filter.ref = ws.dimensions
+    return output.getvalue()
+
+
+def safe_group_summary(df: pd.DataFrame, group_col: str, count_name: str) -> pd.DataFrame:
+    if df.empty or group_col not in df.columns:
+        return pd.DataFrame(columns=[group_col, count_name])
+    values = df.copy()
+    values[group_col] = values[group_col].fillna("Unassigned").astype(str).str.strip().replace("", "Unassigned")
+    return (
+        values.groupby(group_col, dropna=False).size().reset_index(name=count_name)
+        .sort_values(count_name, ascending=False).reset_index(drop=True)
+    )
+
+
+def build_report_html(call_df: pd.DataFrame, pending_df: pd.DataFrame, received_df: pd.DataFrame) -> str:
+    high = int(call_df.get("Final Renewal Possibility", pd.Series(dtype=str)).eq("HIGH").sum())
+    moderate = int(call_df.get("Final Renewal Possibility", pd.Series(dtype=str)).eq("MODERATE").sum())
+    low = int(call_df.get("Final Renewal Possibility", pd.Series(dtype=str)).eq("LOW").sum())
+    caller_summary = safe_group_summary(call_df, "Caller", "Calling List")
+    pending_summary = safe_group_summary(pending_df, "Caller", "Reason Pending")
+    summary = caller_summary.merge(pending_summary, on="Caller", how="outer").fillna(0)
+    for col in ["Calling List", "Reason Pending"]:
+        if col in summary.columns:
+            summary[col] = summary[col].astype(int)
+
+    table_html = summary.to_html(index=False, border=0, classes="summary-table") if not summary.empty else "<p>No caller-wise records available.</p>"
+    generated = datetime.now().strftime("%d-%b-%Y %I:%M %p")
+    return f"""
+    <html><head><style>
+      body {{font-family:Arial,sans-serif;color:#243040;line-height:1.45;background:#f5f7fb;padding:20px;}}
+      .card {{background:#ffffff;border-radius:12px;padding:22px;max-width:900px;margin:auto;border:1px solid #e4e8ef;}}
+      .title {{color:#b4235a;margin:0 0 4px 0;}}
+      .muted {{color:#667085;font-size:13px;}}
+      .metrics {{display:flex;flex-wrap:wrap;gap:10px;margin:18px 0;}}
+      .metric {{background:#f9fafb;border:1px solid #e4e7ec;border-radius:9px;padding:14px;min-width:130px;}}
+      .metric b {{display:block;font-size:25px;color:#101828;}}
+      .metric span {{font-size:12px;color:#667085;}}
+      .alert {{background:#fff4e5;border-left:5px solid #f79009;padding:13px;margin:16px 0;}}
+      .summary-table {{border-collapse:collapse;width:100%;margin-top:10px;}}
+      .summary-table th {{background:#b4235a;color:white;text-align:left;padding:9px;}}
+      .summary-table td {{border-bottom:1px solid #e4e7ec;padding:9px;}}
+      .footer {{font-size:12px;color:#667085;margin-top:20px;}}
+    </style></head><body><div class="card">
+      <h2 class="title">Lyfe Renewal Intelligence Report</h2>
+      <div class="muted">Generated: {generated}</div>
+      <div class="metrics">
+        <div class="metric"><b>{len(call_df)}</b><span>Calling List</span></div>
+        <div class="metric"><b>{high}</b><span>High Possibility</span></div>
+        <div class="metric"><b>{moderate}</b><span>Moderate Possibility</span></div>
+        <div class="metric"><b>{low}</b><span>Low Possibility</span></div>
+        <div class="metric"><b>{len(pending_df)}</b><span>3 Calls Done, Reason Pending</span></div>
+        <div class="metric"><b>{len(received_df)}</b><span>Reason Received, Removed</span></div>
+      </div>
+      <div class="alert"><b>Action required:</b> {len(pending_df)} patient(s) have completed at least 3 renewal calls, are not renewed, and still have no Primary Reason for Non-Renewal.</div>
+      <h3>Caller-wise workload</h3>
+      {table_html}
+      <p>The attached Excel contains the full Renewal Call List, Reason Pending list, and Reason Received list.</p>
+      <div class="footer">Regards,<br>Lyfe Renewal Intelligence</div>
+    </div></body></html>
+    """
+
+
+def create_report_email(sender_email: str, recipients: List[str], cc_list: List[str], bcc_list: List[str],
+                        subject: str, html_body: str, attachment_bytes: bytes, attachment_name: str):
+    message = MIMEMultipart("mixed")
+    message["From"] = formataddr(("Lyfe Renewal Intelligence", sender_email))
+    message["To"] = ", ".join(recipients)
+    if cc_list:
+        message["Cc"] = ", ".join(cc_list)
+    if bcc_list:
+        message["Bcc"] = ", ".join(bcc_list)
+    message["Subject"] = subject
+    alternative = MIMEMultipart("alternative")
+    alternative.attach(MIMEText("Please view this email in HTML format. The detailed renewal report is attached.", "plain", "utf-8"))
+    alternative.attach(MIMEText(html_body, "html", "utf-8"))
+    message.attach(alternative)
+    attachment = MIMEApplication(
+        attachment_bytes,
+        _subtype="vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+    attachment.add_header("Content-Disposition", "attachment", filename=attachment_name)
+    message.attach(attachment)
+    return message
+
+
 # ---------------- Clean and score ----------------
 current, history = clean_df(current), clean_df(history)
 reason_lookup = prepare_reason_data(reason_data)
@@ -779,9 +910,9 @@ for col in DATE_COLUMNS:
             filtered_display[col], errors="coerce"
         ).dt.strftime("%d-%b-%Y").fillna("")
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "📞 Renewal Call List", "⏳ Reason Pending", "👤 Patient Drill-down",
-    "🧠 Logistic Model", "📊 Component Scores"
+    "🧠 Logistic Model", "📊 Component Scores", "✉️ Email Report"
 ])
 
 with tab1:
@@ -946,6 +1077,131 @@ with tab5:
     if "Patient Name" in current.columns:
         component_view.insert(1, "Patient Name", current["Patient Name"].values)
     st.dataframe(component_view, use_container_width=True, hide_index=True)
+
+with tab6:
+    st.subheader("✉️ Send Renewal Intelligence Report")
+    st.caption(
+        "Single Send button se report Operations Team ko jayegi aur Shobnam BCC mein rahegi. "
+        "Email mein executive summary aur attachment mein complete Calling List, Reason Pending, aur Reason Received sheets jayengi."
+    )
+
+    report_html = build_report_html(call_list, reason_pending, reason_received)
+    report_attachment = renewal_report_excel(call_list, reason_pending, reason_received)
+
+    preview1, preview2, preview3, preview4 = st.columns(4)
+    preview1.metric("Calling List", len(call_list))
+    preview2.metric("Reason Pending", len(reason_pending))
+    preview3.metric("Reason Received", len(reason_received))
+    preview4.metric("3+ Calls Pending", int((reason_pending["Renewal Calls Completed Count"] >= 3).sum()) if "Renewal Calls Completed Count" in reason_pending.columns else len(reason_pending))
+
+    with st.expander("📧 Report Preview", expanded=True):
+        st.components.v1.html(report_html, height=600, scrolling=True)
+
+    st.markdown("#### SendGrid Settings")
+    left, right = st.columns(2)
+    with left:
+        report_sender = st.text_input("Verified Sender Email", value=DEFAULT_REPORT_SENDER, key="report_sender").strip()
+        report_to = st.text_input("To", value=DEFAULT_REPORT_RECIPIENTS, key="report_to")
+        report_cc = st.text_input("CC (optional, comma separated)", value="", key="report_cc")
+        report_bcc = st.text_input("BCC", value=DEFAULT_REPORT_BCC, key="report_bcc")
+    with right:
+        default_subject = f"Lyfe Renewal Report | {len(call_list)} Calling | {len(reason_pending)} Reason Pending | {datetime.now().strftime('%d-%b-%Y')}"
+        report_subject = st.text_input("Subject", value=default_subject, key="report_subject")
+        secret_key = ""
+        try:
+            secret_key = st.secrets.get("SENDGRID_API_KEY", "")
+        except Exception:
+            secret_key = ""
+        report_api_key = st.text_input(
+            "SendGrid API Key",
+            value=secret_key,
+            type="password",
+            help="Best practice: Streamlit Secrets mein SENDGRID_API_KEY save karein.",
+            key="report_sendgrid_key",
+        )
+        test_connection = st.button("🔐 Test SendGrid Connection", use_container_width=True, key="test_report_sendgrid")
+
+    if "report_connection_verified" not in st.session_state:
+        st.session_state.report_connection_verified = False
+
+    if test_connection:
+        test_server = None
+        try:
+            if not is_valid_email(report_sender):
+                raise ValueError("Verified Sender Email valid nahi hai.")
+            if not report_api_key.strip():
+                raise ValueError("SendGrid API Key required hai.")
+            test_server = connect_sendgrid(report_api_key)
+            st.session_state.report_connection_verified = True
+            st.success("✅ SendGrid connection successful.")
+        except Exception as exc:
+            st.session_state.report_connection_verified = False
+            st.error(f"❌ SendGrid connection failed: {exc}")
+        finally:
+            if test_server is not None:
+                try:
+                    test_server.quit()
+                except Exception:
+                    pass
+
+    recipients = parse_email_list(report_to)
+    cc_list = parse_email_list(report_cc)
+    bcc_list = parse_email_list(report_bcc)
+    invalid_to = [x.strip() for x in report_to.replace(";", ",").split(",") if x.strip() and not is_valid_email(x.strip())]
+    if invalid_to:
+        st.error(f"Invalid To address: {', '.join(invalid_to)}")
+
+    confirmation = st.checkbox(
+        f"I confirm this report should be sent to {len(recipients)} recipient(s).",
+        key="confirm_renewal_report",
+    )
+    send_report = st.button(
+        "🚀 Send Renewal Report",
+        type="primary",
+        use_container_width=True,
+        disabled=(not confirmation or not recipients or not report_api_key.strip() or not is_valid_email(report_sender)),
+        key="send_renewal_report",
+    )
+
+    if send_report:
+        server = None
+        try:
+            message = create_report_email(
+                sender_email=report_sender,
+                recipients=recipients,
+                cc_list=cc_list,
+                bcc_list=bcc_list,
+                subject=report_subject.strip() or default_subject,
+                html_body=report_html,
+                attachment_bytes=report_attachment,
+                attachment_name=f"lyfe_renewal_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+            )
+            server = connect_sendgrid(report_api_key)
+            all_recipients = list(dict.fromkeys(recipients + cc_list + bcc_list))
+            server.sendmail(report_sender, all_recipients, message.as_string())
+            st.session_state.report_connection_verified = True
+            st.success(
+                f"✅ Renewal report sent successfully to {', '.join(recipients)}. "
+                f"Calling List: {len(call_list)} | Reason Pending: {len(reason_pending)}"
+            )
+        except Exception as exc:
+            st.error("❌ Renewal report send nahi hua.")
+            st.code(str(exc))
+        finally:
+            if server is not None:
+                try:
+                    server.quit()
+                except Exception:
+                    pass
+
+    st.download_button(
+        "📥 Download Same Report Excel",
+        data=report_attachment,
+        file_name=f"lyfe_renewal_report_{datetime.now().strftime('%Y%m%d')}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+    )
+
 
 st.info(
     "Manual weight, penalties aur thresholds fixed hain. Reason present patient calling list se remove hota hai; "
