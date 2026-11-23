@@ -1,15 +1,54 @@
-import streamlit as st
-import pandas as pd
+import io
+import math
+from typing import Dict, List, Optional, Tuple
+
 import numpy as np
+import pandas as pd
+import streamlit as st
 
 st.set_page_config(page_title="Lyfe Renewal Intelligence", page_icon="🩺", layout="wide")
 st.title("🩺 Lyfe Renewal Intelligence")
-st.caption("Manual weightage score aur 2026 ke actually renewed patients ke pattern se similarity, dono alag columns mein.")
+st.caption("Excel upload → Manual score + Logistic Regression → Final renewal call list")
 
 CURRENT_SHEET = "Current_Renewal_Patients"
 HISTORY_SHEET = "Historical_Renewed_2026"
+OUTCOME_COLUMN = "Renewal Outcome"
 
-# ---------------- Sidebar ----------------
+FACTORS = ["LCM", "HC", "CT", "Psychotherapist", "Device/Vitals", "Clinical", "NPS"]
+MODEL_FEATURES = [
+    "LCM Score", "HC Score", "CT Score", "Psychotherapist Score",
+    "Device/Vitals Score", "Clinical Score", "NPS Score",
+    "Days Since Last Completed Call", "Total Relevant Vitals - Last 30 Days",
+    "LCM Calls Completed", "HC Calls Completed", "CT Calls Completed",
+    "Psychotherapist Sessions Completed",
+]
+
+LEARNING_RATE = 0.025
+TRAINING_ITERATIONS = 2200
+REGULARIZATION = 0.01
+MANUAL_FINAL_WEIGHT = 0.50
+LOGISTIC_FINAL_WEIGHT = 0.50
+HIGH_VITALS_MIN = 10
+
+DATE_COLUMNS = [
+    "Subscription Start Date", "Subscription End Date", "Actual Renewal Date",
+    "Next Plan Start Date", "Next Plan End Date", "Renewal Call 1 Date",
+    "Renewal Call 2 Date", "Renewal Call 3 Date", "Last Renewal Call Date",
+    "Last Completed Renewal Call Date", "Last Completed Call Date",
+    "Last Auto Scheduled Call Date", "Last Auto Scheduled Completed Call Date",
+    "Initial Active Weight Date", "Latest Active Weight Date", "Initial SBP Date",
+    "Current SBP Date", "Initial LDL Date", "Current LDL Date",
+    "Initial HbA1c Date", "Current HbA1c Date", "Latest NPS Date",
+]
+
+HIDDEN_TECHNICAL_COLUMNS = [
+    "Vital Devices Available",
+    "Devices With Recent Vitals",
+    "Device Vital Coverage %",
+    "Total Relevant Vitals - Last 30 Days",
+]
+
+# ---------------- Sidebar configuration ----------------
 st.sidebar.header("⚖️ Manual Weightage")
 manual_weights = {
     "LCM": st.sidebar.slider("LCM", 0, 30, 10),
@@ -20,38 +59,55 @@ manual_weights = {
     "Clinical": st.sidebar.slider("Clinical Improvement", 0, 30, 20),
     "NPS": st.sidebar.slider("NPS", 0, 30, 10),
 }
-st.sidebar.metric("Total Manual Weight", sum(manual_weights.values()))
+weight_total = sum(manual_weights.values())
+st.sidebar.metric("Total Manual Weight", weight_total)
+if weight_total != 100:
+    st.sidebar.error("Manual weight total exactly 100 hona chahiye.")
 
 st.sidebar.divider()
 st.sidebar.header("🚨 Penalties")
-pen_silent = st.sidebar.slider("Device but no recent vitals", 0, 30, 15)
-pen_31_60 = st.sidebar.slider("Call gap 31–60 days", 0, 10, 2)
-pen_61_90 = st.sidebar.slider("Call gap 61–90 days", 0, 15, 5)
-pen_90 = st.sidebar.slider("Call gap >90 days", 0, 20, 8)
-pen_no_call = st.sidebar.slider("No completed call", 0, 20, 10)
+penalties = {
+    "Device Available But No Recent Vitals": st.sidebar.slider("Device but no recent vitals", 0, 30, 15),
+    "Call Gap 31-60 Days": st.sidebar.slider("Call gap 31–60 days", 0, 10, 2),
+    "Call Gap 61-90 Days": st.sidebar.slider("Call gap 61–90 days", 0, 15, 5),
+    "Call Gap More Than 90 Days": st.sidebar.slider("Call gap >90 days", 0, 20, 8),
+    "No Completed Call": st.sidebar.slider("No completed call", 0, 20, 10),
+}
 
+st.sidebar.divider()
+st.sidebar.header("🎯 Score Thresholds")
+high_threshold = st.sidebar.slider("High", 50, 100, 75)
+moderate_threshold = st.sidebar.slider("Moderate", 0, high_threshold, 50)
+
+# ---------------- Upload ----------------
 file = st.file_uploader("📂 Upload patients_data_2026 Excel", type=["xlsx"])
 if file is None:
     st.info(f"Excel upload karein. Required tabs: `{CURRENT_SHEET}` and `{HISTORY_SHEET}`")
     st.stop()
-
-# ---------------- Read workbook ----------------
-try:
-    xls = pd.ExcelFile(file, engine="openpyxl")
-    missing = [s for s in [CURRENT_SHEET, HISTORY_SHEET] if s not in xls.sheet_names]
-    if missing:
-        st.error(f"Missing Excel tabs: {missing}")
-        st.write("Available tabs:", xls.sheet_names)
-        st.stop()
-    current = pd.read_excel(file, sheet_name=CURRENT_SHEET, engine="openpyxl")
-    history = pd.read_excel(file, sheet_name=HISTORY_SHEET, engine="openpyxl")
-except Exception as e:
-    st.error("Excel read nahi hua.")
-    st.exception(e)
+if weight_total != 100:
+    st.error("Sidebar mein manual weightage total 100 karke app run karein.")
     st.stop()
 
+@st.cache_data(show_spinner=False)
+def read_workbook(file_bytes: bytes) -> Tuple[pd.DataFrame, pd.DataFrame, List[str]]:
+    buffer = io.BytesIO(file_bytes)
+    xls = pd.ExcelFile(buffer, engine="openpyxl")
+    missing = [s for s in [CURRENT_SHEET, HISTORY_SHEET] if s not in xls.sheet_names]
+    if missing:
+        raise ValueError(f"Missing Excel tabs: {missing}. Available tabs: {xls.sheet_names}")
+    current = pd.read_excel(xls, sheet_name=CURRENT_SHEET)
+    history = pd.read_excel(xls, sheet_name=HISTORY_SHEET)
+    return current, history, xls.sheet_names
 
-def clean_df(df):
+try:
+    current, history, sheet_names = read_workbook(file.getvalue())
+except Exception as exc:
+    st.error("Excel read nahi hua.")
+    st.exception(exc)
+    st.stop()
+
+# ---------------- Helpers ----------------
+def clean_df(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df.columns = df.columns.astype(str).str.strip()
     df = df.loc[:, ~df.columns.duplicated()].copy()
@@ -59,17 +115,14 @@ def clean_df(df):
         df = df.rename(columns={"Patient Name2": "Patient Name"})
     return df
 
-current = clean_df(current)
-history = clean_df(history)
 
-# ---------------- Helpers ----------------
-def nseries(df, col, default=np.nan):
+def numeric_series(df: pd.DataFrame, col: str, default=np.nan) -> pd.Series:
     if col not in df.columns:
         return pd.Series(default, index=df.index, dtype=float)
     return pd.to_numeric(df[col], errors="coerce")
 
 
-def first_numeric(df, names, default=np.nan):
+def first_numeric(df: pd.DataFrame, names: List[str], default=np.nan) -> pd.Series:
     out = pd.Series(np.nan, index=df.index, dtype=float)
     for name in names:
         if name in df.columns:
@@ -77,249 +130,503 @@ def first_numeric(df, names, default=np.nan):
     return out.fillna(default) if not pd.isna(default) else out
 
 
-def service_component(df, scheduled, completed, pct, target):
-    sch = nseries(df, scheduled, 0).fillna(0).astype(float)
-    comp = nseries(df, completed, 0).fillna(0).astype(float)
-    rate = nseries(df, pct).astype(float)
-
-    calculated_rate = pd.Series(
-        np.where(sch > 0, (comp / sch) * 100, np.nan),
-        index=df.index,
-        dtype=float
-    )
-
-    rate = rate.fillna(calculated_rate)
-    effort = (comp / float(target)).clip(0, 1) * 100
-    score = rate.clip(0, 100) * 0.70 + effort * 0.30
-    return score.where(sch > 0)
-
-
-def yes_series(df, col):
+def yes_series(df: pd.DataFrame, col: str) -> pd.Series:
     if col not in df.columns:
         return pd.Series(False, index=df.index)
     return df[col].astype(str).str.strip().str.upper().isin(["YES", "Y", "TRUE", "1"])
 
 
-def build_components(df, historical=False):
+def service_component(df: pd.DataFrame, scheduled: str, completed: str, pct: str, target: int) -> pd.Series:
+    sch = numeric_series(df, scheduled, 0).fillna(0).astype(float)
+    comp = numeric_series(df, completed, 0).fillna(0).astype(float)
+    stored_pct = numeric_series(df, pct)
+    calculated_pct = pd.Series(np.where(sch > 0, comp / sch * 100, np.nan), index=df.index)
+    completion = stored_pct.fillna(calculated_pct).clip(0, 100)
+    effort = (comp / float(target)).clip(0, 1) * 100
+    return (completion * 0.70 + effort * 0.30).where(sch > 0)
+
+
+def trend_score(series: pd.Series) -> pd.Series:
+    text = series.astype(str).str.strip().str.upper()
+    score = pd.Series(np.nan, index=series.index, dtype=float)
+    missing = (
+        text.eq("") | text.str.contains("NO INITIAL", na=False) |
+        text.str.contains("NO CURRENT", na=False) |
+        text.str.contains("NO ACTIVE", na=False) |
+        text.str.contains("ONLY ONE", na=False)
+    )
+    score[text.str.contains("REDUCED|IMPROVED", regex=True, na=False)] = 100
+    score[text.str.contains("NO CHANGE|SAME|STABLE", regex=True, na=False)] = 50
+    score[text.str.contains("INCREASED|DETERIORATED", regex=True, na=False)] = 0
+    score[missing] = np.nan
+    return score
+
+
+def build_components(df: pd.DataFrame, historical: bool = False) -> Tuple[pd.DataFrame, pd.Series, pd.Series]:
     c = pd.DataFrame(index=df.index)
     c["LCM"] = service_component(df, "LCM Calls Scheduled", "LCM Calls Completed", "LCM Completion %", 6)
     c["HC"] = service_component(df, "HC Calls Scheduled", "HC Calls Completed", "HC Completion %", 6)
     c["CT"] = service_component(df, "CT Calls Scheduled", "CT Calls Completed", "CT Completion %", 6)
     c["Psychotherapist"] = service_component(
         df, "Psychotherapist Sessions Scheduled", "Psychotherapist Sessions Completed",
-        "Psychotherapist Completion %", 4
+        "Psychotherapist Completion %", 4,
     )
 
     available = first_numeric(df, ["Vital Devices Available", "Active Device Count"])
-    if available.isna().all():
-        available = (
-            yes_series(df, "BP Monitor Available").astype(int)
-            + yes_series(df, "Weight Scale Available").astype(int)
-            + yes_series(df, "Glucometer Available").astype(int)
-            + yes_series(df, "Oximeter Available").astype(int)
-        ).astype(float)
+    inferred_available = (
+        yes_series(df, "BP Monitor Available").astype(int)
+        + yes_series(df, "Weight Scale Available").astype(int)
+        + yes_series(df, "Glucometer Available").astype(int)
+        + yes_series(df, "Oximeter Available").astype(int)
+    ).astype(float)
+    available = available.fillna(inferred_available)
 
     recent_vitals = first_numeric(
-        df,
-        ["Total Relevant Vitals - Last 30 Days", "Vital Readings - Last 30 Days of Plan"],
-        0,
+        df, ["Total Relevant Vitals - Last 30 Days", "Vital Readings - Last 30 Days of Plan"], 0
     ).fillna(0)
     coverage = first_numeric(df, ["Device Vital Coverage %"])
     devices_used = first_numeric(df, ["Devices With Recent Vitals"])
-    inferred_coverage = np.where(available > 0, devices_used / available * 100, np.nan)
-    coverage = coverage.fillna(pd.Series(inferred_coverage, index=df.index))
+    inferred_coverage = pd.Series(
+        np.where(available > 0, devices_used / available * 100, np.nan), index=df.index
+    )
+    coverage = coverage.fillna(inferred_coverage)
     activity = (recent_vitals / (available.clip(lower=1) * 4)).clip(0, 1) * 100
-    c["Device/Vitals"] = (coverage.clip(0, 100) * 0.80 + activity * 0.20).where(available > 0)
+    c["Device/Vitals"] = (
+        coverage.clip(0, 100).fillna(activity) * 0.80 + activity * 0.20
+    ).where(available > 0)
 
-    trend_cols = ["Weight Trend", "SBP Trend", "LDL Trend", "HbA1c Trend"]
-    trend_scores = []
-    for col in trend_cols:
+    trend_frames = []
+    for col in ["Weight Trend", "SBP Trend", "LDL Trend", "HbA1c Trend"]:
         if col in df.columns:
-            t = df[col].astype(str).str.upper()
-            s = pd.Series(np.nan, index=df.index)
-            s[t.str.contains("REDUCED", na=False)] = 100
-            s[t.str.contains("NO CHANGE", na=False)] = 50
-            s[t.str.contains("INCREASED", na=False)] = 0
-            trend_scores.append(s)
-
-    # Historical query has no SBP/LDL/HbA1c trends. Use available outcome values as neutral evidence,
-    # while weight trend remains outcome-based.
+            trend_frames.append(trend_score(df[col]).rename(col))
     if historical:
         for col in ["Latest SBP - Plan", "Latest LDL - Plan", "Latest HbA1c - Plan"]:
             if col in df.columns:
-                v = pd.to_numeric(df[col], errors="coerce")
-                trend_scores.append(pd.Series(np.where(v.notna(), 50, np.nan), index=df.index))
-
-    c["Clinical"] = pd.concat(trend_scores, axis=1).mean(axis=1, skipna=True) if trend_scores else np.nan
-    c["NPS"] = nseries(df, "Latest NPS Score").clip(0, 10) * 10
+                values = pd.to_numeric(df[col], errors="coerce")
+                trend_frames.append(pd.Series(np.where(values.notna(), 50, np.nan), index=df.index, name=col))
+    c["Clinical"] = pd.concat(trend_frames, axis=1).mean(axis=1, skipna=True) if trend_frames else np.nan
+    c["NPS"] = numeric_series(df, "Latest NPS Score").clip(0, 10) * 10
     return c, available, recent_vitals
 
 
-def weighted_score(components, weights):
+def weighted_score(components: pd.DataFrame, weights: Dict[str, int]) -> pd.Series:
     numerator = pd.Series(0.0, index=components.index)
     denominator = pd.Series(0.0, index=components.index)
-    for col, weight in weights.items():
-        valid = components[col].notna()
-        numerator += components[col].fillna(0) / 100 * weight
+    for factor, weight in weights.items():
+        valid = components[factor].notna()
+        numerator += components[factor].fillna(0) / 100 * weight
         denominator += valid.astype(float) * weight
     return (numerator / denominator.replace(0, np.nan) * 100).fillna(0)
 
 
-def band(score, high=75, moderate=50):
-    return np.select(
-        [score >= high, score >= moderate],
-        ["🟢 High", "🟡 Moderate"],
-        default="🔴 Low",
+def possibility(score: pd.Series) -> pd.Series:
+    return pd.Series(
+        np.select(
+            [score >= high_threshold, score >= moderate_threshold],
+            ["HIGH", "MODERATE"], default="LOW"
+        ), index=score.index,
     )
 
-# ---------------- Current month ----------------
-for col in ["Subscription End Date", "Last Completed Call Date"]:
-    if col in current.columns:
-        current[col] = pd.to_datetime(current[col], errors="coerce")
 
-if "Subscription End Date" not in current.columns:
-    st.error("Current sheet mein `Subscription End Date` missing hai.")
+def model_features(df: pd.DataFrame, components: pd.DataFrame) -> np.ndarray:
+    columns = [
+        components["LCM"].fillna(0).clip(0, 100),
+        components["HC"].fillna(0).clip(0, 100),
+        components["CT"].fillna(0).clip(0, 100),
+        components["Psychotherapist"].fillna(0).clip(0, 100),
+        components["Device/Vitals"].fillna(0).clip(0, 100),
+        components["Clinical"].fillna(0).clip(0, 100),
+        components["NPS"].fillna(0).clip(0, 100),
+        first_numeric(df, ["Days Since Last Completed Call", "Days Since Last Completed Call at Plan End"], 180).clip(0, 365),
+        first_numeric(df, ["Total Relevant Vitals - Last 30 Days", "Vital Readings - Last 30 Days of Plan"], 0).clip(0, 500),
+        numeric_series(df, "LCM Calls Completed", 0).fillna(0).clip(0, 50),
+        numeric_series(df, "HC Calls Completed", 0).fillna(0).clip(0, 50),
+        numeric_series(df, "CT Calls Completed", 0).fillna(0).clip(0, 50),
+        numeric_series(df, "Psychotherapist Sessions Completed", 0).fillna(0).clip(0, 50),
+    ]
+    return np.column_stack([s.to_numpy(dtype=float) for s in columns])
+
+
+def renewal_outcome(df: pd.DataFrame) -> pd.Series:
+    outcome = pd.Series(np.nan, index=df.index, dtype=float)
+    if OUTCOME_COLUMN in df.columns:
+        numeric = pd.to_numeric(df[OUTCOME_COLUMN], errors="coerce")
+        outcome[numeric.isin([0, 1])] = numeric[numeric.isin([0, 1])]
+    status_col = "Renewal Status" if "Renewal Status" in df.columns else "Renewal Outcome Label"
+    if status_col in df.columns:
+        status = df[status_col].astype(str).str.strip().str.upper()
+        outcome[status.eq("RENEWED")] = 1
+        outcome[status.isin(["NOT RENEWED", "EXPIRED", "LOST", "DROPPED"])] = 0
+    return outcome
+
+
+def sigmoid(z: np.ndarray) -> np.ndarray:
+    z = np.clip(z, -35, 35)
+    return 1.0 / (1.0 + np.exp(-z))
+
+
+def train_logistic(history_df: pd.DataFrame, components: pd.DataFrame):
+    y_all = renewal_outcome(history_df)
+    mask = y_all.isin([0, 1])
+    if mask.sum() == 0:
+        raise ValueError("Historical sheet mein valid Renewal Outcome 0/1 ya Renewal Status labels nahi mile.")
+    X = model_features(history_df.loc[mask].reset_index(drop=True), components.loc[mask].reset_index(drop=True))
+    y = y_all.loc[mask].to_numpy(dtype=float)
+    renewed = int((y == 1).sum())
+    not_renewed = int((y == 0).sum())
+    if renewed == 0 or not_renewed == 0:
+        raise ValueError(f"Logistic model ke liye dono classes chahiye. Renewed={renewed}, Not Renewed={not_renewed}.")
+
+    means = X.mean(axis=0)
+    sds = X.std(axis=0)
+    sds[sds < 0.000001] = 1.0
+    Xs = (X - means) / sds
+    beta = np.zeros(Xs.shape[1] + 1)
+    renewed_weight = len(y) / (2 * renewed)
+    not_renewed_weight = len(y) / (2 * not_renewed)
+    sample_weight = np.where(y == 1, renewed_weight, not_renewed_weight)
+
+    for _ in range(TRAINING_ITERATIONS):
+        z = beta[0] + Xs @ beta[1:]
+        error = (sigmoid(z) - y) * sample_weight
+        beta[0] -= LEARNING_RATE * error.mean()
+        beta[1:] -= LEARNING_RATE * ((Xs.T @ error) / len(y) + REGULARIZATION * beta[1:])
+
+    return {
+        "coefficients": beta, "means": means, "sds": sds,
+        "training_rows": len(y), "renewed_rows": renewed, "not_renewed_rows": not_renewed,
+        "renewed_weight": renewed_weight, "not_renewed_weight": not_renewed_weight,
+    }
+
+
+def predict_logistic(df: pd.DataFrame, components: pd.DataFrame, model: dict) -> pd.Series:
+    X = model_features(df, components)
+    Xs = (X - model["means"]) / model["sds"]
+    probability = sigmoid(model["coefficients"][0] + Xs @ model["coefficients"][1:]) * 100
+    return pd.Series(probability, index=df.index)
+
+
+def logistic_label(scores: pd.Series) -> pd.Series:
+    return pd.Series(np.select(
+        [scores >= 75, scores >= 50, scores >= 30],
+        ["HIGH RENEWAL CHANCE", "MODERATE RENEWAL CHANCE", "LOW RENEWAL CHANCE"],
+        default="VERY LOW RENEWAL CHANCE",
+    ), index=scores.index)
+
+
+def fmt_num(value, decimals=1) -> str:
+    try:
+        if pd.isna(value):
+            return ""
+        return f"{float(value):.{decimals}f}".rstrip("0").rstrip(".")
+    except Exception:
+        return str(value)
+
+
+def positive_highlights(row: pd.Series) -> str:
+    parts = []
+    for label, comp_col, sched_col, minimum in [
+        ("LCM", "LCM Calls Completed", "LCM Calls Scheduled", 2),
+        ("HC", "HC Calls Completed", "HC Calls Scheduled", 2),
+        ("CT", "CT Calls Completed", "CT Calls Scheduled", 3),
+    ]:
+        completed = pd.to_numeric(pd.Series([row.get(comp_col)]), errors="coerce").iloc[0]
+        scheduled = pd.to_numeric(pd.Series([row.get(sched_col)]), errors="coerce").iloc[0]
+        if pd.notna(completed) and pd.notna(scheduled) and scheduled > 0 and completed >= minimum:
+            parts.append(f"{label}: {int(completed)}/{int(scheduled)} completed")
+    for col, label, unit in [
+        ("Weight Reduction (kg)", "Weight reduced", "kg"),
+        ("SBP Reduction from Initial", "SBP reduced", "mmHg"),
+        ("LDL Reduction from Initial", "LDL reduced", ""),
+        ("HbA1c Reduction from Initial", "HbA1c reduced", ""),
+    ]:
+        value = pd.to_numeric(pd.Series([row.get(col)]), errors="coerce").iloc[0]
+        if pd.notna(value) and value > 0:
+            parts.append(f"{label} by {fmt_num(value)}{(' ' + unit) if unit else ''}")
+    nps = pd.to_numeric(pd.Series([row.get("Latest NPS Score")]), errors="coerce").iloc[0]
+    if pd.notna(nps) and nps >= 9:
+        parts.append(f"Promoter NPS {int(round(nps))}")
+    return "; ".join(parts) if parts else "No strong positive signal available"
+
+
+def risk_factors(row: pd.Series) -> str:
+    parts = []
+    gap = pd.to_numeric(pd.Series([row.get("Days Since Last Completed Call")]), errors="coerce").iloc[0]
+    if pd.isna(gap):
+        parts.append("No completed-call date available")
+    elif gap > 90:
+        parts.append(f"Last completed call {int(round(gap))} days ago")
+    elif gap > 60:
+        parts.append(f"Call gap {int(round(gap))} days")
+    devices = pd.to_numeric(pd.Series([row.get("Vital Devices Available", row.get("Active Device Count"))]), errors="coerce").iloc[0]
+    vitals = pd.to_numeric(pd.Series([row.get("Total Relevant Vitals - Last 30 Days")]), errors="coerce").iloc[0]
+    if pd.notna(devices) and devices > 0 and (pd.isna(vitals) or vitals == 0):
+        parts.append("Device available but no recent vitals")
+    pending = pd.to_numeric(pd.Series([row.get("System Renewal Calls Remaining")]), errors="coerce").iloc[0]
+    if pd.notna(pending) and pending > 0:
+        parts.append(f"{int(round(pending))} renewal call(s) pending")
+    return "; ".join(parts) if parts else "No major risk flag"
+
+
+def decide_caller(row: pd.Series) -> str:
+    hc = str(row.get("HC Name", "") or "").strip()
+    lcm = str(row.get("LCM Name", "") or "").strip()
+    for n in [3, 2, 1]:
+        status = str(row.get(f"Renewal Call {n} Status", "") or "").strip().upper()
+        role = str(row.get(f"Renewal Call {n} Role", "") or "").strip().upper()
+        if status == "COMPLETED":
+            if role in ["COACH", "HC", "HEALTH COACH"] and hc:
+                return hc
+            if role == "LCM" and lcm:
+                return lcm
+    vitals = pd.to_numeric(pd.Series([row.get("Total Relevant Vitals - Last 30 Days")]), errors="coerce").iloc[0]
+    if pd.notna(vitals) and vitals >= HIGH_VITALS_MIN and lcm:
+        return lcm
+    improvement_cols = ["Weight Reduction (kg)", "SBP Reduction from Initial", "LDL Reduction from Initial", "HbA1c Reduction from Initial"]
+    if any((pd.to_numeric(pd.Series([row.get(c)]), errors="coerce").fillna(0).iloc[0] > 0) for c in improvement_cols) and hc:
+        return hc
+    return hc or lcm or "Unassigned"
+
+
+def suggested_pitch(row: pd.Series) -> str:
+    name = str(row.get("Patient Name", "patient") or "patient").strip()
+    plan = str(row.get("Current Plan Name", "current plan") or "current plan").strip()
+    logistic = float(row.get("Logistic Model Score", 0) or 0)
+    guidance = (
+        "Ask for renewal confirmation and next-plan preference." if logistic >= 75 else
+        "Reinforce achieved benefits and resolve objections." if logistic >= 50 else
+        "First understand barriers, affordability and service concerns."
+    )
+    return (
+        f"Discuss renewal with {name}. Highlight {row.get('Positive Highlights', '')}. "
+        f"Position renewal as continuity of {plan}, care-team support, monitoring and further improvement. {guidance}"
+    )
+
+
+def format_expiry_status(days) -> str:
+    if pd.isna(days):
+        return ""
+    days = int(round(float(days)))
+    if days < 0:
+        return f"Plan expired {abs(days)} days ago"
+    if days == 0:
+        return "Plan expires today"
+    return f"{days} days remaining"
+
+
+def to_excel_bytes(df: pd.DataFrame, model: dict) -> bytes:
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        df.to_excel(writer, sheet_name="Renewal_Call_List", index=False)
+        model_df = pd.DataFrame({
+            "Feature": ["Intercept"] + MODEL_FEATURES,
+            "Coefficient": model["coefficients"],
+            "Historical Mean": [np.nan] + list(model["means"]),
+            "Historical SD": [np.nan] + list(model["sds"]),
+        })
+        model_df.to_excel(writer, sheet_name="Logistic_Model", index=False)
+        ws = writer.book["Renewal_Call_List"]
+        for col_idx, name in enumerate(df.columns, 1):
+            if "Date" in name:
+                for row_idx in range(2, len(df) + 2):
+                    ws.cell(row=row_idx, column=col_idx).number_format = "dd-mmm-yyyy"
+        ws.freeze_panes = "A2"
+        ws.auto_filter.ref = ws.dimensions
+    return output.getvalue()
+
+# ---------------- Clean and score ----------------
+current = clean_df(current)
+history = clean_df(history)
+if current.empty or history.empty:
+    st.error("Current ya Historical sheet empty hai.")
     st.stop()
 
-current = current[current["Subscription End Date"].notna()].copy()
-current["Renewal Month"] = current["Subscription End Date"].dt.strftime("%b %Y")
-current["Renewal Month Sort"] = current["Subscription End Date"].dt.to_period("M").dt.to_timestamp()
-month_list = (
-    current[["Renewal Month", "Renewal Month Sort"]]
-    .drop_duplicates().sort_values("Renewal Month Sort")["Renewal Month"].tolist()
-)
-selected_month = st.selectbox("📅 Select Renewal Month", month_list)
-current_month = current[current["Renewal Month"] == selected_month].copy().reset_index(drop=True)
+for df in [current, history]:
+    for col in DATE_COLUMNS:
+        if col in df.columns:
+            df[col] = pd.to_datetime(df[col], errors="coerce")
 
-# ---------------- Components and history profile ----------------
-current_comp, current_devices, current_recent_vitals = build_components(current_month, historical=False)
+current_comp, current_devices, current_vitals = build_components(current, historical=False)
 history_comp, _, _ = build_components(history, historical=True)
 
-history_profile = history_comp.mean(skipna=True)
-history_valid_count = history_comp.notna().sum()
+try:
+    model = train_logistic(history, history_comp)
+except Exception as exc:
+    st.error("Logistic Regression train nahi hua.")
+    st.exception(exc)
+    st.stop()
 
-# Historical weights: stable renewed-pattern strength, not predictive coefficients.
-# A factor receives more weight when renewed patients consistently have a high component score.
-history_raw = (history_profile.fillna(0) / 100) * np.sqrt(history_valid_count.clip(lower=0))
-if history_raw.sum() > 0:
-    history_weights = history_raw / history_raw.sum() * 100
-else:
-    history_weights = pd.Series(100 / len(history_profile), index=history_profile.index)
-
-# ---------------- Manual score ----------------
 manual_base = weighted_score(current_comp, manual_weights)
+gap = first_numeric(current, ["Days Since Last Completed Call"])
+if gap.isna().all() and "Last Completed Call Date" in current.columns:
+    gap = (pd.Timestamp.today().normalize() - current["Last Completed Call Date"].dt.normalize()).dt.days
 
-source_gap = first_numeric(current_month, ["Days Since Last Completed Call"])
-if source_gap.isna().all() and "Last Completed Call Date" in current_month.columns:
-    source_gap = (pd.Timestamp.today().normalize() - current_month["Last Completed Call Date"].dt.normalize()).dt.days
+call_penalty = pd.Series(0.0, index=current.index)
+call_penalty[gap.between(31, 60, inclusive="both")] = penalties["Call Gap 31-60 Days"]
+call_penalty[gap.between(61, 90, inclusive="both")] = penalties["Call Gap 61-90 Days"]
+call_penalty[gap > 90] = penalties["Call Gap More Than 90 Days"]
+call_penalty[gap.isna()] = penalties["No Completed Call"]
 
-call_penalty = pd.Series(0.0, index=current_month.index)
-call_penalty[source_gap.between(31, 60, inclusive="both")] = pen_31_60
-call_penalty[source_gap.between(61, 90, inclusive="both")] = pen_61_90
-call_penalty[source_gap > 90] = pen_90
-call_penalty[source_gap.isna()] = pen_no_call
+device_penalty = ((current_devices > 0) & (current_vitals == 0)).astype(float) * penalties["Device Available But No Recent Vitals"]
+manual_score = (manual_base - call_penalty - device_penalty).clip(0, 100)
+logistic_score = predict_logistic(current, current_comp, model)
+final_score = (manual_score * MANUAL_FINAL_WEIGHT + logistic_score * LOGISTIC_FINAL_WEIGHT).clip(0, 100)
 
-silent_flag = (current_devices > 0) & (current_recent_vitals == 0)
-device_penalty = silent_flag.astype(float) * pen_silent
-manual_final = (manual_base - call_penalty - device_penalty).clip(0, 100)
+scored = current.copy()
+scored["Manual Renewal Score"] = manual_score.round(1)
+scored["Manual Possibility"] = possibility(manual_score)
+scored["Logistic Model Score"] = logistic_score.round(1)
+scored["Logistic Prediction"] = logistic_label(logistic_score)
+scored["Final Renewal Score"] = final_score.round(1)
+scored["Final Renewal Possibility"] = possibility(final_score)
+scored["Call Gap Penalty"] = call_penalty
+scored["Device Penalty"] = device_penalty
+scored["Caller"] = scored.apply(decide_caller, axis=1)
+scored["Positive Highlights"] = scored.apply(positive_highlights, axis=1)
+scored["Risk Factors"] = scored.apply(risk_factors, axis=1)
+scored["Suggested Renewal Pitch"] = scored.apply(suggested_pitch, axis=1)
 
-current_month["Manual Renewal Score"] = manual_final.round(1)
-current_month["Manual Possibility"] = band(manual_final)
-current_month["Call Gap Penalty"] = call_penalty
-current_month["Device Penalty"] = device_penalty
-current_month["Silent Device Flag"] = np.where(silent_flag, "🚨 Device Active But No Recent Vitals", "OK")
+if "Days Remaining" in scored.columns:
+    scored["Days to / Since Plan Expiry"] = scored["Days Remaining"].apply(format_expiry_status)
 
-# ---------------- Historical renewed pattern similarity ----------------
-# Similarity per component: 100 at renewed mean; gradually decreases with distance.
-similarity = pd.DataFrame(index=current_comp.index)
-for col in current_comp.columns:
-    target = history_profile.get(col, np.nan)
-    if pd.isna(target):
-        similarity[col] = np.nan
-    else:
-        similarity[col] = (100 - (current_comp[col] - target).abs()).clip(0, 100)
+# Do not show renewed patients in the working call list by default.
+if "Renewal Status" in scored.columns:
+    call_list = scored[scored["Renewal Status"].astype(str).str.strip().str.upper().ne("RENEWED")].copy()
+else:
+    call_list = scored.copy()
 
-history_weight_dict = history_weights.to_dict()
-historical_match_score = weighted_score(similarity, history_weight_dict)
-current_month["Historical Renewed Pattern Score"] = historical_match_score.round(1)
-current_month["Historical Pattern Match"] = band(historical_match_score, high=80, moderate=60)
+call_list = call_list.sort_values(["Final Renewal Score"], ascending=False).reset_index(drop=True)
 
-# ---------------- Tabs ----------------
-tab1, tab2, tab3 = st.tabs([
-    "🎯 Current Renewal Possibility",
-    "📚 Historical Renewed Pattern",
-    "⚖️ Weightage Comparison",
+# ---------------- Filters ----------------
+st.sidebar.divider()
+st.sidebar.header("🔎 Call List Filters")
+filtered = call_list.copy()
+for col, label in [
+    ("Included Because", "Included Because"),
+    ("Final Renewal Possibility", "Final Possibility"),
+    ("Caller", "Caller"),
+    ("HC Name", "HC"),
+    ("LCM Name", "LCM"),
+    ("Renewal Status", "Renewal Status"),
+]:
+    if col in filtered.columns:
+        options = sorted([x for x in filtered[col].dropna().astype(str).unique() if x.strip()])
+        selected = st.sidebar.multiselect(label, options)
+        if selected:
+            filtered = filtered[filtered[col].astype(str).isin(selected)]
+
+search_text = st.sidebar.text_input("Identifier / Patient Name search").strip().lower()
+if search_text:
+    identifier = filtered.get("Identifier", pd.Series("", index=filtered.index)).astype(str).str.lower()
+    patient_name = filtered.get("Patient Name", pd.Series("", index=filtered.index)).astype(str).str.lower()
+    filtered = filtered[identifier.str.contains(search_text, na=False) | patient_name.str.contains(search_text, na=False)]
+
+# ---------------- Dashboard ----------------
+metrics = st.columns(6)
+metrics[0].metric("Call List", len(filtered))
+metrics[1].metric("Final High", int(filtered["Final Renewal Possibility"].eq("HIGH").sum()))
+metrics[2].metric("Final Moderate", int(filtered["Final Renewal Possibility"].eq("MODERATE").sum()))
+metrics[3].metric("Final Low", int(filtered["Final Renewal Possibility"].eq("LOW").sum()))
+metrics[4].metric("Renewed Training", model["renewed_rows"])
+metrics[5].metric("Not-Renewed Training", model["not_renewed_rows"])
+
+important_columns = [
+    "Identifier", "Patient Name", "Caller",
+    "Manual Renewal Score", "Manual Possibility",
+    "Logistic Model Score", "Logistic Prediction",
+    "Final Renewal Score", "Final Renewal Possibility",
+    "Positive Highlights", "Risk Factors", "Suggested Renewal Pitch",
+    "Email", "Subscription Start Date", "Subscription End Date",
+    "Days to / Since Plan Expiry", "Included Because", "Renewal Status",
+]
+remaining_columns = [c for c in filtered.columns if c not in important_columns and c not in HIDDEN_TECHNICAL_COLUMNS and c != "Days Remaining"]
+display_columns = [c for c in important_columns if c in filtered.columns] + remaining_columns
+
+for col in DATE_COLUMNS:
+    if col in filtered.columns:
+        filtered[col] = filtered[col].dt.strftime("%d-%b-%Y").fillna("")
+
+tab1, tab2, tab3, tab4 = st.tabs([
+    "📞 Renewal Call List", "👤 Patient Drill-down", "🧠 Logistic Model", "📊 Component Scores"
 ])
 
 with tab1:
-    st.subheader(f"{selected_month} Current Renewal Patients")
-    m1, m2, m3, m4, m5, m6 = st.columns(6)
-    m1.metric("Total", len(current_month))
-    m2.metric("Manual High", int((current_month["Manual Possibility"] == "🟢 High").sum()))
-    m3.metric("Manual Moderate", int((current_month["Manual Possibility"] == "🟡 Moderate").sum()))
-    m4.metric("Manual Low", int((current_month["Manual Possibility"] == "🔴 Low").sum()))
-    m5.metric("Historical Strong Match", int((current_month["Historical Pattern Match"] == "🟢 High").sum()))
-    m6.metric("Silent Devices", int(silent_flag.sum()))
-
-    show_cols = [
-        "Patient ID", "Identifier", "Patient Name", "Subscription End Date",
-        "LCM Calls Completed", "HC Calls Completed", "CT Calls Completed",
-        "Psychotherapist Sessions Completed", "Latest NPS Score",
-        "Last Completed Call Date", "Days Since Last Completed Call",
-        "Silent Device Flag", "Manual Renewal Score", "Manual Possibility",
-        "Historical Renewed Pattern Score", "Historical Pattern Match",
-    ]
-    show_cols = [c for c in show_cols if c in current_month.columns]
-    st.dataframe(
-        current_month[show_cols].sort_values(
-            ["Historical Renewed Pattern Score", "Manual Renewal Score"], ascending=False
-        ),
-        use_container_width=True,
-        hide_index=True,
+    st.subheader("Renewal Call List")
+    st.dataframe(filtered[display_columns], use_container_width=True, hide_index=True, height=620)
+    col1, col2 = st.columns(2)
+    col1.download_button(
+        "📥 Download filtered CSV",
+        filtered[display_columns].to_csv(index=False).encode("utf-8-sig"),
+        "renewal_call_list.csv", "text/csv",
     )
-
-    st.download_button(
-        "📥 Download scored current patients",
-        current_month.drop(columns=["Renewal Month Sort"], errors="ignore").to_csv(index=False).encode("utf-8"),
-        f"{selected_month.replace(' ', '_').lower()}_manual_historical_scores.csv",
-        "text/csv",
+    excel_df = call_list[[c for c in display_columns if c in call_list.columns]].copy()
+    col2.download_button(
+        "📥 Download full Excel",
+        to_excel_bytes(excel_df, model),
+        "renewal_call_list_scored.xlsx",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
 with tab2:
-    st.subheader("2026 Actually Renewed Patients Pattern")
-    st.metric("Historical renewed rows", len(history))
+    st.subheader("Patient-level details")
+    if filtered.empty:
+        st.info("Current filters mein patient nahi hai.")
+    else:
+        choices = filtered.apply(
+            lambda r: f"{r.get('Identifier', '')} | {r.get('Patient Name', '')}", axis=1
+        ).tolist()
+        selected_patient = st.selectbox("Patient select karein", choices)
+        selected_index = choices.index(selected_patient)
+        row = filtered.iloc[selected_index]
+        a, b, c, d = st.columns(4)
+        a.metric("Final Score", row.get("Final Renewal Score", ""))
+        b.metric("Manual Score", row.get("Manual Renewal Score", ""))
+        c.metric("Logistic Score", row.get("Logistic Model Score", ""))
+        d.metric("Caller", row.get("Caller", ""))
+        st.markdown(f"**Positive Highlights:** {row.get('Positive Highlights', '')}")
+        st.markdown(f"**Risk Factors:** {row.get('Risk Factors', '')}")
+        st.markdown(f"**Suggested Renewal Pitch:** {row.get('Suggested Renewal Pitch', '')}")
 
-    profile_df = pd.DataFrame({
-        "Factor": history_profile.index,
-        "Renewed Patient Average Score": history_profile.values,
-        "Available Historical Records": history_valid_count.reindex(history_profile.index).values,
-        "Historical Renewed Weightage %": history_weights.reindex(history_profile.index).values,
-    }).round(2)
-    st.dataframe(profile_df, use_container_width=True, hide_index=True)
-
-    hist_cols = [
-        "Identifier", "Patient Name", "Plan Name", "Plan Start Date", "Plan End Date",
-        "Next Plan Name", "Next Plan Start Date", "Days to Next Plan",
-        "LCM Completion %", "HC Completion %", "CT Completion %",
-        "Psychotherapist Completion %", "Vital Readings - Last 30 Days of Plan",
-        "Weight Change %", "Latest NPS Score",
-    ]
-    hist_cols = [c for c in hist_cols if c in history.columns]
-    st.dataframe(history[hist_cols], use_container_width=True, hide_index=True)
+        sections = {
+            "Plan & Renewal": [c for c in row.index if any(k in c for k in ["Subscription", "Plan", "Renewal", "Included Because"])],
+            "Calls": [c for c in row.index if any(k in c for k in ["Calls Scheduled", "Calls Completed", "Completion %", "Last Completed Call"])],
+            "Devices & Vitals": [c for c in row.index if any(k in c for k in ["Device", "Vitals", "Readings - Last 30 Days", "Vital Engagement"])],
+            "Clinical": [c for c in row.index if any(k in c for k in ["Weight", "SBP", "LDL", "HbA1c"])],
+            "NPS": [c for c in row.index if "NPS" in c or "Feedback" in c],
+        }
+        for section, cols in sections.items():
+            with st.expander(section, expanded=(section == "Plan & Renewal")):
+                details = pd.DataFrame({"Field": cols, "Value": [row.get(c, "") for c in cols]})
+                st.dataframe(details, use_container_width=True, hide_index=True)
 
 with tab3:
-    st.subheader("Manual vs Historical Renewed Weightage")
-    comparison = pd.DataFrame({
-        "Factor": list(manual_weights.keys()),
-        "Manual Weightage %": [manual_weights[k] for k in manual_weights],
-        "Historical Renewed Weightage %": [history_weights.get(k, 0) for k in manual_weights],
-        "Renewed Patient Average Score": [history_profile.get(k, np.nan) for k in manual_weights],
-        "Historical Records Used": [history_valid_count.get(k, 0) for k in manual_weights],
-    }).round(2)
-    st.dataframe(comparison, use_container_width=True, hide_index=True)
-    st.bar_chart(comparison.set_index("Factor")[["Manual Weightage %", "Historical Renewed Weightage %"]])
+    st.subheader("Logistic Regression Model")
+    st.write(
+        f"Training rows: **{model['training_rows']}** | Renewed: **{model['renewed_rows']}** | "
+        f"Not Renewed: **{model['not_renewed_rows']}**"
+    )
+    coef_df = pd.DataFrame({
+        "Feature": ["Intercept"] + MODEL_FEATURES,
+        "Coefficient": model["coefficients"],
+        "Historical Mean": [np.nan] + list(model["means"]),
+        "Historical SD": [np.nan] + list(model["sds"]),
+    })
+    coef_df["Direction"] = np.where(coef_df["Coefficient"] > 0.0001, "POSITIVE", np.where(coef_df["Coefficient"] < -0.0001, "NEGATIVE", "NEUTRAL"))
+    st.dataframe(coef_df.round(6), use_container_width=True, hide_index=True)
+
+    z_values = np.arange(-6, 6.01, 0.25)
+    curve = pd.DataFrame({"Z Score": z_values, "Logistic Probability": sigmoid(z_values)})
+    st.line_chart(curve.set_index("Z Score"))
+
+with tab4:
+    st.subheader("Current-patient component scores")
+    component_view = current_comp.copy().round(1)
+    for col in ["Identifier", "Patient Name"]:
+        if col in current.columns:
+            component_view.insert(len(component_view.columns) if col == "Patient Name" else 0, col, current[col].values)
+    st.dataframe(component_view, use_container_width=True, hide_index=True)
 
 st.info(
-    "Historical Renewed Pattern Score probability nahi hai. Ye current patient ka pattern, "
-    "2026 mein actually renewed patients ke average engagement/outcome pattern se similarity dikhata hai."
+    "Device technical columns UI table mein hidden hain, lekin Manual Score aur Logistic Regression mein use hote hain. "
+    "Final Renewal Score = 50% Manual Renewal Score + 50% Logistic Model Score."
 )
