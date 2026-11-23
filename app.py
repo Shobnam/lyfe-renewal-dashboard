@@ -103,7 +103,7 @@ def read_workbook(file_bytes: bytes) -> Tuple[pd.DataFrame, pd.DataFrame, pd.Dat
     reason_data = pd.DataFrame()
 
     patient_aliases = {"patient id", "patientid", "identifier", "patient identifier"}
-    reason_aliases = {"primary reason", "reason", "renewal reason"}
+    reason_aliases = {"primary reason", "primary reason for non-renewal", "reason", "renewal reason"}
     for sheet in xls.sheet_names:
         if sheet in [CURRENT_SHEET, HISTORY_SHEET]:
             continue
@@ -181,7 +181,7 @@ def prepare_reason_data(reason_df: pd.DataFrame) -> pd.DataFrame:
         return None
 
     patient_col = find_col(["patient id", "patientid", "identifier", "patient identifier"])
-    reason_col = find_col(["primary reason", "reason", "renewal reason"])
+    reason_col = find_col(["primary reason", "primary reason for non-renewal", "reason", "renewal reason"])
     comment_col = find_col(["comment", "comments", "remark", "remarks"])
     completion_col = find_col(["completion time", "completed time", "response time", "submitted at"])
 
@@ -582,17 +582,43 @@ scored["_Patient_Key"] = normalize_identifier(
 scored = scored.merge(reason_lookup, on="_Patient_Key", how="left")
 for col in ["Reason", "Reason Comment"]:
     scored[col] = scored[col].fillna("").astype(str).str.strip()
-scored["Reason Status"] = np.where(scored["Reason"].ne(""), "REASON RECEIVED", "REASON PENDING")
+# Count completed renewal calls from the three renewal-call status fields.
+completed_status_cols = [
+    c for c in ["Renewal Call 1 Status", "Renewal Call 2 Status", "Renewal Call 3 Status"]
+    if c in scored.columns
+]
+if completed_status_cols:
+    scored["Renewal Calls Completed Count"] = sum(
+        scored[c].fillna("").astype(str).str.strip().str.upper().eq("COMPLETED").astype(int)
+        for c in completed_status_cols
+    )
+else:
+    # Fallback only when the three status columns are unavailable.
+    scored["Renewal Calls Completed Count"] = first_numeric(
+        scored, ["Renewal Calls Completed", "System Renewal Calls Completed"], 0
+    ).fillna(0).astype(int)
 
 not_renewed = pd.Series(True, index=scored.index)
 if "Renewal Status" in scored.columns:
     not_renewed = scored["Renewal Status"].astype(str).str.strip().str.upper().ne("RENEWED")
 
 eligible_population = scored[not_renewed].copy()
+# Any filled non-renewal reason removes the patient from the calling list immediately.
 reason_received = eligible_population[eligible_population["Reason"].ne("")].copy()
 call_list = eligible_population[eligible_population["Reason"].eq("")].copy()
 call_list = call_list.sort_values("Final Renewal Score", ascending=False).reset_index(drop=True)
-reason_received = reason_received.sort_values("Reason Completion Time", ascending=False, na_position="last").reset_index(drop=True)
+reason_received = reason_received.sort_values(
+    "Reason Completion Time", ascending=False, na_position="last"
+).reset_index(drop=True)
+
+# Reason Pending is intentionally narrower than the calling list:
+# exactly 3 renewal calls completed + not renewed + no reason filled.
+reason_pending = call_list[call_list["Renewal Calls Completed Count"] >= 3].copy()
+reason_pending["Reason Status"] = "REASON PENDING"
+# Other calling-list patients do not need a reason yet.
+call_list["Reason Status"] = np.where(
+    call_list["Renewal Calls Completed Count"] >= 3, "REASON PENDING", ""
+)
 
 # ---------------- Top filters ----------------
 st.markdown("### 🔎 Call List Filters")
@@ -693,31 +719,31 @@ with tab1:
 with tab2:
     st.subheader("Reason Pending")
     r1, r2, r3 = st.columns(3)
-    r1.metric("Total Reason Pending", len(call_list))
+    r1.metric("Total Reason Pending", len(reason_pending))
     r2.metric("Reason Received - Removed", len(reason_received))
     r3.metric("Eligible Patient Population", len(eligible_population))
 
     st.caption(
-        "Reason blank patients yahan pending hain. Reason milte hi patient calling list se remove ho jayega, "
-        "chahe 1, 2 ya 3 calls completed hon. Reason blank ho to 3 completed calls ke baad bhi patient dikhega."
+        "Yahan sirf 3 renewal calls COMPLETED + not renewed + reason blank patients dikhte hain. "
+        "Kisi bhi stage par Primary Reason for Non-Renewal fill hote hi patient calling list aur Reason Pending dono se remove ho jayega."
     )
 
     pending_columns = [c for c in [
         "Identifier", "Patient Name", "Caller", "Caller Role", "HC Name", "LCM Name",
-        "Reason Status", "Final Renewal Score", "Final Renewal Possibility",
+        "Reason Status", "Renewal Calls Completed Count", "Final Renewal Score", "Final Renewal Possibility",
         "Renewal Call 1 Status", "Renewal Call 2 Status", "Renewal Call 3 Status",
         "Subscription End Date", "Renewal Status",
-    ] if c in call_list.columns]
-    pending_view = call_list[pending_columns].copy()
+    ] if c in reason_pending.columns]
+    pending_view = reason_pending[pending_columns].copy()
     for date_col in ["Subscription End Date"]:
         if date_col in pending_view.columns:
             pending_view[date_col] = pd.to_datetime(
                 pending_view[date_col], errors="coerce"
             ).dt.strftime("%d-%b-%Y").fillna("")
 
-    if "Caller" in call_list.columns and not call_list.empty:
+    if "Caller" in reason_pending.columns and not reason_pending.empty:
         caller_summary = (
-            call_list.groupby(["Caller", "Caller Role"], dropna=False)
+            reason_pending.groupby(["Caller", "Caller Role"], dropna=False)
             .size().reset_index(name="Reason Pending Count")
             .sort_values("Reason Pending Count", ascending=False)
         )
@@ -801,7 +827,7 @@ with tab5:
 
 st.info(
     "Manual weight, penalties aur thresholds fixed hain. Reason present patient calling list se remove hota hai; "
-    "Reason blank patient 3 completed calls ke baad bhi list mein rehta hai. Reason Pending tab count aur details dikhata hai. "
+    "Reason blank patient calling list mein rehta hai; Reason Pending tab sirf 3 completed renewal calls + not renewed + blank reason patients dikhata hai. "
     "Uploaded Excel next calendar day app rerun hote hi automatically remove ho jayegi. "
     "Final Score = 50% Manual + 50% Logistic."
 )
