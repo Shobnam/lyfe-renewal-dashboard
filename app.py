@@ -648,7 +648,7 @@ def safe_group_summary(df: pd.DataFrame, group_col: str, count_name: str) -> pd.
     )
 
 
-def build_report_html(call_df: pd.DataFrame, pending_df: pd.DataFrame, received_df: pd.DataFrame) -> str:
+def build_report_html(call_df: pd.DataFrame, pending_df: pd.DataFrame, received_df: pd.DataFrame, renewed_count: int) -> str:
     high = int(call_df.get("Final Renewal Possibility", pd.Series(dtype=str)).eq("HIGH").sum())
     moderate = int(call_df.get("Final Renewal Possibility", pd.Series(dtype=str)).eq("MODERATE").sum())
     low = int(call_df.get("Final Renewal Possibility", pd.Series(dtype=str)).eq("LOW").sum())
@@ -681,6 +681,7 @@ def build_report_html(call_df: pd.DataFrame, pending_df: pd.DataFrame, received_
       <div class="muted">Generated: {generated}</div>
       <div class="metrics">
         <div class="metric"><b>{len(call_df)}</b><span>Calling List</span></div>
+        <div class="metric"><b>{renewed_count}</b><span>Renewed</span></div>
         <div class="metric"><b>{high}</b><span>High Possibility</span></div>
         <div class="metric"><b>{moderate}</b><span>Moderate Possibility</span></div>
         <div class="metric"><b>{low}</b><span>Low Possibility</span></div>
@@ -819,6 +820,7 @@ not_renewed = pd.Series(True, index=scored.index)
 if "Renewal Status" in scored.columns:
     not_renewed = scored["Renewal Status"].astype(str).str.strip().str.upper().ne("RENEWED")
 
+renewed_count = int((~not_renewed).sum())
 eligible_population = scored[not_renewed].copy()
 # Any filled non-renewal reason removes the patient from the calling list immediately.
 reason_received = eligible_population[eligible_population["Reason"].ne("")].copy()
@@ -1085,14 +1087,15 @@ with tab6:
         "Email mein executive summary aur attachment mein complete Calling List, Reason Pending, aur Reason Received sheets jayengi."
     )
 
-    report_html = build_report_html(call_list, reason_pending, reason_received)
+    report_html = build_report_html(call_list, reason_pending, reason_received, renewed_count)
     report_attachment = renewal_report_excel(call_list, reason_pending, reason_received)
 
-    preview1, preview2, preview3, preview4 = st.columns(4)
+    preview1, preview2, preview3, preview4, preview5 = st.columns(5)
     preview1.metric("Calling List", len(call_list))
-    preview2.metric("Reason Pending", len(reason_pending))
-    preview3.metric("Reason Received", len(reason_received))
-    preview4.metric("3+ Calls Pending", int((reason_pending["Renewal Calls Completed Count"] >= 3).sum()) if "Renewal Calls Completed Count" in reason_pending.columns else len(reason_pending))
+    preview2.metric("Renewed", renewed_count)
+    preview3.metric("High Possibility", int(call_list["Final Renewal Possibility"].eq("HIGH").sum()))
+    preview4.metric("Moderate Possibility", int(call_list["Final Renewal Possibility"].eq("MODERATE").sum()))
+    preview5.metric("3 Calls Done, Reason Pending", len(reason_pending))
 
     with st.expander("📧 Report Preview", expanded=True):
         st.components.v1.html(report_html, height=600, scrolling=True)
@@ -1105,7 +1108,7 @@ with tab6:
         report_cc = st.text_input("CC (optional, comma separated)", value="", key="report_cc")
         report_bcc = st.text_input("BCC", value=DEFAULT_REPORT_BCC, key="report_bcc")
     with right:
-        default_subject = f"Lyfe Renewal Report | {len(call_list)} Calling | {len(reason_pending)} Reason Pending | {datetime.now().strftime('%d-%b-%Y')}"
+        default_subject = f"Lyfe Renewal Report | {renewed_count} Renewed | {len(call_list)} Calling | {len(reason_pending)} Reason Pending | {datetime.now().strftime('%d-%b-%Y')}"
         report_subject = st.text_input("Subject", value=default_subject, key="report_subject")
         secret_key = ""
         try:
