@@ -86,15 +86,34 @@ if (
 
 
 @st.cache_data(show_spinner=False)
-def read_workbook(file_bytes: bytes) -> Tuple[pd.DataFrame, pd.DataFrame, List[str]]:
+def read_workbook(file_bytes: bytes) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, List[str]]:
+    """Read scoring sheets and automatically find an optional reason-response sheet.
+
+    A reason sheet is recognized when it contains Patient Id/Patient ID/Identifier
+    plus Primary Reason/Reason. Screenshot-type Microsoft Forms exports are supported.
+    """
     buffer = io.BytesIO(file_bytes)
     xls = pd.ExcelFile(buffer, engine="openpyxl")
-    missing = [s for s in [CURRENT_SHEET, HISTORY_SHEET] if s not in xls.sheet_names]
+    missing = [name for name in [CURRENT_SHEET, HISTORY_SHEET] if name not in xls.sheet_names]
     if missing:
         raise ValueError(f"Missing Excel tabs: {missing}. Available tabs: {xls.sheet_names}")
+
     current = pd.read_excel(xls, sheet_name=CURRENT_SHEET)
     history = pd.read_excel(xls, sheet_name=HISTORY_SHEET)
-    return current, history, xls.sheet_names
+    reason_data = pd.DataFrame()
+
+    patient_aliases = {"patient id", "patientid", "identifier", "patient identifier"}
+    reason_aliases = {"primary reason", "reason", "renewal reason"}
+    for sheet in xls.sheet_names:
+        if sheet in [CURRENT_SHEET, HISTORY_SHEET]:
+            continue
+        candidate = pd.read_excel(xls, sheet_name=sheet)
+        normalized = {str(col).strip().lower() for col in candidate.columns}
+        if normalized.intersection(patient_aliases) and normalized.intersection(reason_aliases):
+            reason_data = candidate
+            break
+
+    return current, history, reason_data, xls.sheet_names
 
 
 if st.session_state.uploaded_excel_bytes is None:
@@ -124,7 +143,7 @@ else:
         st.rerun()
 
 try:
-    current, history, sheet_names = read_workbook(st.session_state.uploaded_excel_bytes)
+    current, history, reason_data, sheet_names = read_workbook(st.session_state.uploaded_excel_bytes)
 except Exception as exc:
     st.error("Excel read nahi hua.")
     st.exception(exc)
@@ -138,6 +157,50 @@ def clean_df(df: pd.DataFrame) -> pd.DataFrame:
     if "Patient Name" not in df.columns and "Patient Name2" in df.columns:
         df = df.rename(columns={"Patient Name2": "Patient Name"})
     return df
+
+
+def normalize_identifier(series: pd.Series) -> pd.Series:
+    return (
+        series.fillna("").astype(str).str.strip().str.upper()
+        .str.replace(r"\.0$", "", regex=True)
+    )
+
+
+def prepare_reason_data(reason_df: pd.DataFrame) -> pd.DataFrame:
+    """Return one latest reason record per patient."""
+    if reason_df.empty:
+        return pd.DataFrame(columns=["_Patient_Key", "Reason", "Reason Comment", "Reason Completion Time"])
+
+    df = clean_df(reason_df)
+    lower_map = {str(col).strip().lower(): col for col in df.columns}
+
+    def find_col(aliases):
+        for alias in aliases:
+            if alias in lower_map:
+                return lower_map[alias]
+        return None
+
+    patient_col = find_col(["patient id", "patientid", "identifier", "patient identifier"])
+    reason_col = find_col(["primary reason", "reason", "renewal reason"])
+    comment_col = find_col(["comment", "comments", "remark", "remarks"])
+    completion_col = find_col(["completion time", "completed time", "response time", "submitted at"])
+
+    if not patient_col or not reason_col:
+        return pd.DataFrame(columns=["_Patient_Key", "Reason", "Reason Comment", "Reason Completion Time"])
+
+    out = pd.DataFrame(index=df.index)
+    out["_Patient_Key"] = normalize_identifier(df[patient_col])
+    out["Reason"] = df[reason_col].fillna("").astype(str).str.strip()
+    out["Reason Comment"] = (
+        df[comment_col].fillna("").astype(str).str.strip() if comment_col else ""
+    )
+    out["Reason Completion Time"] = (
+        pd.to_datetime(df[completion_col], errors="coerce") if completion_col else pd.NaT
+    )
+    out = out[out["_Patient_Key"].ne("")].copy()
+    out = out.sort_values("Reason Completion Time", na_position="first")
+    out = out.drop_duplicates("_Patient_Key", keep="last")
+    return out
 
 
 def numeric_series(df: pd.DataFrame, col: str, default=np.nan) -> pd.Series:
@@ -455,6 +518,7 @@ def to_excel_bytes(df, model):
 
 # ---------------- Clean and score ----------------
 current, history = clean_df(current), clean_df(history)
+reason_lookup = prepare_reason_data(reason_data)
 if current.empty or history.empty:
     st.error("Current ya Historical sheet empty hai.")
     st.stop()
@@ -508,12 +572,27 @@ scored["Suggested Renewal Pitch"] = scored.apply(suggested_pitch, axis=1)
 if "Days Remaining" in scored.columns:
     scored["Days to / Since Plan Expiry"] = scored["Days Remaining"].apply(format_expiry_status)
 
-call_list = scored.copy()
-if "Renewal Status" in call_list.columns:
-    call_list = call_list[
-        call_list["Renewal Status"].astype(str).str.strip().str.upper().ne("RENEWED")
-    ]
+# ---------------- Reason mapping and calling-list eligibility ----------------
+# Rule: if Reason is present, remove the patient immediately, irrespective of
+# whether 1, 2 or 3 renewal calls are completed. If Reason is blank, keep the
+# patient in the calling list even after 3 completed calls.
+scored["_Patient_Key"] = normalize_identifier(
+    scored.get("Identifier", pd.Series("", index=scored.index))
+)
+scored = scored.merge(reason_lookup, on="_Patient_Key", how="left")
+for col in ["Reason", "Reason Comment"]:
+    scored[col] = scored[col].fillna("").astype(str).str.strip()
+scored["Reason Status"] = np.where(scored["Reason"].ne(""), "REASON RECEIVED", "REASON PENDING")
+
+not_renewed = pd.Series(True, index=scored.index)
+if "Renewal Status" in scored.columns:
+    not_renewed = scored["Renewal Status"].astype(str).str.strip().str.upper().ne("RENEWED")
+
+eligible_population = scored[not_renewed].copy()
+reason_received = eligible_population[eligible_population["Reason"].ne("")].copy()
+call_list = eligible_population[eligible_population["Reason"].eq("")].copy()
 call_list = call_list.sort_values("Final Renewal Score", ascending=False).reset_index(drop=True)
+reason_received = reason_received.sort_values("Reason Completion Time", ascending=False, na_position="last").reset_index(drop=True)
 
 # ---------------- Top filters ----------------
 st.markdown("### 🔎 Call List Filters")
@@ -547,7 +626,7 @@ if search_text:
 secondary_cols = st.columns(3)
 for box, (col, label) in zip(secondary_cols, [
     ("Final Renewal Possibility", "Final Possibility"),
-    ("Included Because", "Included Because"),
+    ("Reason Status", "Reason Status"),
     ("Renewal Status", "Renewal Status"),
 ]):
     if col in filtered.columns:
@@ -572,13 +651,13 @@ important_columns = [
     "Manual Renewal Score", "Manual Possibility", "Logistic Model Score", "Logistic Prediction",
     "Final Renewal Score", "Final Renewal Possibility", "Positive Highlights", "Risk Factors",
     "Suggested Renewal Pitch", "Email", "Subscription Start Date", "Subscription End Date",
-    "Days to / Since Plan Expiry", "Included Because", "Renewal Status",
+    "Days to / Since Plan Expiry", "Reason Status", "Renewal Status",
 ]
 remaining = [
     c for c in filtered.columns
     if c not in important_columns
     and c not in HIDDEN_TECHNICAL_COLUMNS
-    and c != "Days Remaining"
+    and c not in ["Days Remaining", "_Patient_Key", "Reason", "Reason Comment", "Reason Completion Time"]
 ]
 display_columns = [c for c in important_columns if c in filtered.columns] + remaining
 filtered_display = filtered.copy()
@@ -588,8 +667,9 @@ for col in DATE_COLUMNS:
             filtered_display[col], errors="coerce"
         ).dt.strftime("%d-%b-%Y").fillna("")
 
-tab1, tab2, tab3, tab4 = st.tabs([
-    "📞 Renewal Call List", "👤 Patient Drill-down", "🧠 Logistic Model", "📊 Component Scores"
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    "📞 Renewal Call List", "⏳ Reason Pending", "👤 Patient Drill-down",
+    "🧠 Logistic Model", "📊 Component Scores"
 ])
 
 with tab1:
@@ -611,6 +691,49 @@ with tab1:
     )
 
 with tab2:
+    st.subheader("Reason Pending")
+    r1, r2, r3 = st.columns(3)
+    r1.metric("Total Reason Pending", len(call_list))
+    r2.metric("Reason Received - Removed", len(reason_received))
+    r3.metric("Eligible Patient Population", len(eligible_population))
+
+    st.caption(
+        "Reason blank patients yahan pending hain. Reason milte hi patient calling list se remove ho jayega, "
+        "chahe 1, 2 ya 3 calls completed hon. Reason blank ho to 3 completed calls ke baad bhi patient dikhega."
+    )
+
+    pending_columns = [c for c in [
+        "Identifier", "Patient Name", "Caller", "Caller Role", "HC Name", "LCM Name",
+        "Reason Status", "Final Renewal Score", "Final Renewal Possibility",
+        "Renewal Call 1 Status", "Renewal Call 2 Status", "Renewal Call 3 Status",
+        "Subscription End Date", "Renewal Status",
+    ] if c in call_list.columns]
+    pending_view = call_list[pending_columns].copy()
+    for date_col in ["Subscription End Date"]:
+        if date_col in pending_view.columns:
+            pending_view[date_col] = pd.to_datetime(
+                pending_view[date_col], errors="coerce"
+            ).dt.strftime("%d-%b-%Y").fillna("")
+
+    if "Caller" in call_list.columns and not call_list.empty:
+        caller_summary = (
+            call_list.groupby(["Caller", "Caller Role"], dropna=False)
+            .size().reset_index(name="Reason Pending Count")
+            .sort_values("Reason Pending Count", ascending=False)
+        )
+        st.markdown("#### Caller-wise pending reasons")
+        st.dataframe(caller_summary, use_container_width=True, hide_index=True)
+
+    st.markdown("#### Patient-wise pending reasons")
+    st.dataframe(pending_view, use_container_width=True, hide_index=True, height=520)
+    st.download_button(
+        "📥 Download Reason Pending CSV",
+        pending_view.to_csv(index=False).encode("utf-8-sig"),
+        "reason_pending_patients.csv",
+        "text/csv",
+    )
+
+with tab3:
     st.subheader("Patient-level details")
     if filtered_display.empty:
         st.info("Current filters mein patient nahi hai.")
@@ -644,7 +767,7 @@ with tab2:
                     hide_index=True,
                 )
 
-with tab3:
+with tab4:
     st.subheader("Logistic Regression Model")
     st.write(
         f"Training rows: **{model['training_rows']}** | Renewed: **{model['renewed_rows']}** | "
@@ -667,7 +790,7 @@ with tab3:
         pd.DataFrame({"Z Score": z_values, "Logistic Probability": sigmoid(z_values)}).set_index("Z Score")
     )
 
-with tab4:
+with tab5:
     st.subheader("Current-patient component scores")
     component_view = current_comp.copy().round(1)
     if "Identifier" in current.columns:
@@ -677,7 +800,8 @@ with tab4:
     st.dataframe(component_view, use_container_width=True, hide_index=True)
 
 st.info(
-    "Manual weight, penalties aur thresholds fixed hain. Filters top par hain. "
+    "Manual weight, penalties aur thresholds fixed hain. Reason present patient calling list se remove hota hai; "
+    "Reason blank patient 3 completed calls ke baad bhi list mein rehta hai. Reason Pending tab count aur details dikhata hai. "
     "Uploaded Excel next calendar day app rerun hote hi automatically remove ho jayegi. "
     "Final Score = 50% Manual + 50% Logistic."
 )
