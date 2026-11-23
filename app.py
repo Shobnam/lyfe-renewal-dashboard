@@ -141,12 +141,12 @@ def read_workbook(file_bytes: bytes) -> Tuple[pd.DataFrame, pd.DataFrame, pd.Dat
 
 if st.session_state.uploaded_excel_bytes is None:
     uploaded = st.file_uploader(
-        "📂 Aaj ka patients_data_2026 Excel upload karein",
+        "📂 Upload today's patients_data_2026 Excel",
         type=["xlsx"],
         key="renewal_excel_uploader",
     )
     if uploaded is None:
-        st.info(f"Required tabs: `{CURRENT_SHEET}` and `{HISTORY_SHEET}`. Optional tabs: `Reasons`, `Escalation Whatsapp`, `Escalation Mail`. File next calendar day automatically remove ho jayegi.")
+        st.info(f"Required tabs: `{CURRENT_SHEET}` and `{HISTORY_SHEET}`. Optional tabs: `Reasons`, `Escalation Whatsapp`, `Escalation Mail`. The uploaded file will automatically expire on the next calendar day.")
         st.stop()
     st.session_state.uploaded_excel_bytes = uploaded.getvalue()
     st.session_state.uploaded_excel_name = uploaded.name
@@ -168,7 +168,7 @@ else:
 try:
     current, history, reason_data, escalation_whatsapp, escalation_mail, sheet_names = read_workbook(st.session_state.uploaded_excel_bytes)
 except Exception as exc:
-    st.error("Excel read nahi hua.")
+    st.error("Unable to read the Excel file.")
     st.exception(exc)
     st.stop()
 
@@ -430,12 +430,12 @@ def train_logistic(history_df, components):
     y_all = renewal_outcome(history_df)
     mask = y_all.isin([0, 1])
     if mask.sum() == 0:
-        raise ValueError("Historical sheet mein valid Renewal Outcome 0/1 ya Renewal Status labels nahi mile.")
+        raise ValueError("No valid Renewal Outcome values (0/1) or Renewal Status labels were found in the Historical sheet.")
     X = model_features(history_df.loc[mask].reset_index(drop=True), components.loc[mask].reset_index(drop=True))
     y = y_all.loc[mask].to_numpy(dtype=float)
     renewed, not_renewed = int((y == 1).sum()), int((y == 0).sum())
     if renewed == 0 or not_renewed == 0:
-        raise ValueError(f"Dono classes chahiye. Renewed={renewed}, Not Renewed={not_renewed}.")
+        raise ValueError(f"Both outcome classes are required. Renewed={renewed}, Not Renewed={not_renewed}.")
     means, sds = X.mean(axis=0), X.std(axis=0)
     sds[sds < 0.000001] = 1.0
     Xs = (X - means) / sds
@@ -729,7 +729,7 @@ all_escalations = pd.concat(
     [escalation_whatsapp_view, escalation_mail_view], ignore_index=True
 )
 if current.empty or history.empty:
-    st.error("Current ya Historical sheet empty hai.")
+    st.error("The Current or Historical sheet is empty.")
     st.stop()
 
 for df in [current, history]:
@@ -742,7 +742,7 @@ history_comp, _, _ = build_components(history, historical=True)
 try:
     model = train_logistic(history, history_comp)
 except Exception as exc:
-    st.error("Logistic Regression train nahi hua.")
+    st.error("Unable to train the Logistic Regression model.")
     st.exception(exc)
     st.stop()
 
@@ -943,8 +943,8 @@ with tab2:
     r3.metric("Eligible Patient Population", len(eligible_population))
 
     st.caption(
-        "Yahan sirf 3 renewal calls COMPLETED + not renewed + reason blank patients dikhte hain. "
-        "Kisi bhi stage par Primary Reason for Non-Renewal fill hote hi patient calling list aur Reason Pending dono se remove ho jayega."
+        "This section shows only patients with at least 3 completed renewal calls who have not renewed and still have no non-renewal reason. "
+        "Once a Primary Reason for Non-Renewal is recorded at any stage, the patient is removed from both the Calling List and Reason Pending list."
     )
 
     pending_columns = [c for c in [
@@ -981,12 +981,12 @@ with tab2:
 with tab3:
     st.subheader("Patient-level details")
     if filtered_display.empty:
-        st.info("Current filters mein patient nahi hai.")
+        st.info("No patients match the current filters.")
     else:
         choices = filtered_display.apply(
             lambda r: f"{r.get('Identifier', '')} | {r.get('Patient Name', '')}", axis=1
         ).tolist()
-        selected_patient = st.selectbox("Patient select karein", choices)
+        selected_patient = st.selectbox("Select a patient", choices)
         row = filtered_display.iloc[choices.index(selected_patient)]
         a, b, c, d = st.columns(4)
         a.metric("Final Score", row.get("Final Renewal Score", ""))
@@ -1034,7 +1034,7 @@ with tab3:
             expanded=not patient_escalations.empty,
         ):
             if patient_escalations.empty:
-                st.info("Selected patient ke liye Escalation Whatsapp ya Escalation Mail record nahi mila.")
+                st.info("No Escalation WhatsApp or Escalation Mail record was found for the selected patient.")
             else:
                 visible_escalation_cols = [
                     col for col in escalation_display_cols
@@ -1083,8 +1083,8 @@ with tab5:
 with tab6:
     st.subheader("✉️ Send Renewal Intelligence Report")
     st.caption(
-        "Single Send button se report Operations Team ko jayegi aur Shobnam BCC mein rahegi. "
-        "Email mein executive summary aur attachment mein complete Calling List, Reason Pending, aur Reason Received sheets jayengi."
+        "Click Send Renewal Report to email the report to the Operations Team, with Shobnam in BCC. "
+        "The email includes an executive summary and an Excel attachment containing the complete Calling List, Reason Pending, and Reason Received sheets."
     )
 
     report_html = build_report_html(call_list, reason_pending, reason_received, renewed_count)
@@ -1119,7 +1119,7 @@ with tab6:
             "SendGrid API Key",
             value=secret_key,
             type="password",
-            help="Best practice: Streamlit Secrets mein SENDGRID_API_KEY save karein.",
+            help="Best practice: save SENDGRID_API_KEY in Streamlit Secrets.",
             key="report_sendgrid_key",
         )
         test_connection = st.button("🔐 Test SendGrid Connection", use_container_width=True, key="test_report_sendgrid")
@@ -1131,9 +1131,9 @@ with tab6:
         test_server = None
         try:
             if not is_valid_email(report_sender):
-                raise ValueError("Verified Sender Email valid nahi hai.")
+                raise ValueError("The Verified Sender Email is not valid.")
             if not report_api_key.strip():
-                raise ValueError("SendGrid API Key required hai.")
+                raise ValueError("A SendGrid API Key is required.")
             test_server = connect_sendgrid(report_api_key)
             st.session_state.report_connection_verified = True
             st.success("✅ SendGrid connection successful.")
@@ -1188,7 +1188,7 @@ with tab6:
                 f"Calling List: {len(call_list)} | Reason Pending: {len(reason_pending)}"
             )
         except Exception as exc:
-            st.error("❌ Renewal report send nahi hua.")
+            st.error("❌ The renewal report could not be sent.")
             st.code(str(exc))
         finally:
             if server is not None:
@@ -1207,8 +1207,8 @@ with tab6:
 
 
 st.info(
-    "Manual weight, penalties aur thresholds fixed hain. Reason present patient calling list se remove hota hai; "
-    "Reason blank patient calling list mein rehta hai; Reason Pending tab sirf 3 completed renewal calls + not renewed + blank reason patients dikhata hai. "
-    "Uploaded Excel next calendar day app rerun hote hi automatically remove ho jayegi. "
+    "Manual weights, penalties, and thresholds are fixed. Patients with a recorded non-renewal reason are removed from the Calling List; "
+    "patients with a blank reason remain on the Calling List. The Reason Pending tab shows only patients with at least 3 completed renewal calls, no renewal, and no recorded reason. "
+    "The uploaded Excel file automatically expires on the next calendar day when the app runs. "
     "Final Score = 50% Manual + 50% Logistic."
 )
