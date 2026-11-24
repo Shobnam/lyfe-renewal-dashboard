@@ -140,6 +140,99 @@ def num(row,col,default=np.nan):
     v=pd.to_numeric(pd.Series([row.get(col)]),errors="coerce").iloc[0]; return default if pd.isna(v) else v
 
 
+def decide_caller(row):
+    """Choose the caller using the established renewal ownership rules."""
+    hc = str(row.get("HC Name", "") or "").strip()
+    lcm = str(row.get("LCM Name", "") or "").strip()
+
+    # First preference: owner role of the latest completed renewal call.
+    for n in [3, 2, 1]:
+        status = str(row.get(f"Renewal Call {n} Status", "") or "").strip().upper()
+        role = str(row.get(f"Renewal Call {n} Role", "") or "").strip().upper()
+        if status == "COMPLETED":
+            if role in ["COACH", "HC", "HEALTH COACH"] and hc:
+                return hc
+            if role == "LCM" and lcm:
+                return lcm
+
+    # High recent vital engagement goes to LCM when available.
+    if num(row, "Total Relevant Vitals - Last 30 Days", 0) >= HIGH_VITALS_MIN and lcm:
+        return lcm
+
+    # Clinical improvement goes to HC when available.
+    improvement_cols = [
+        "Weight Reduction (kg)",
+        "SBP Reduction from Initial",
+        "LDL Reduction from Initial",
+        "HbA1c Reduction from Initial",
+    ]
+    if any(num(row, col, 0) > 0 for col in improvement_cols) and hc:
+        return hc
+
+    return hc or lcm or "Unassigned"
+
+
+def determine_caller_role(row):
+    caller = str(row.get("Caller", "") or "").strip()
+    hc = str(row.get("HC Name", "") or "").strip()
+    lcm = str(row.get("LCM Name", "") or "").strip()
+    if caller and hc and caller.casefold() == hc.casefold():
+        return "HC"
+    if caller and lcm and caller.casefold() == lcm.casefold():
+        return "LCM"
+    return "UNASSIGNED"
+
+
+def positive_highlights(row):
+    parts = []
+    for label, completed_col, scheduled_col, minimum in [
+        ("LCM", "LCM Calls Completed", "LCM Calls Scheduled", 2),
+        ("HC", "HC Calls Completed", "HC Calls Scheduled", 2),
+        ("CT", "CT Calls Completed", "CT Calls Scheduled", 3),
+    ]:
+        completed, scheduled = num(row, completed_col), num(row, scheduled_col)
+        if pd.notna(completed) and pd.notna(scheduled) and scheduled > 0 and completed >= minimum:
+            parts.append(f"{label}: {int(completed)}/{int(scheduled)} completed")
+    for col, label, unit in [
+        ("Weight Reduction (kg)", "Weight reduced", "kg"),
+        ("SBP Reduction from Initial", "SBP reduced", "mmHg"),
+        ("LDL Reduction from Initial", "LDL reduced", ""),
+        ("HbA1c Reduction from Initial", "HbA1c reduced", ""),
+    ]:
+        value = num(row, col)
+        if pd.notna(value) and value > 0:
+            parts.append(f"{label} by {float(value):.1f}{(' ' + unit) if unit else ''}")
+    nps = num(row, "Latest NPS Score")
+    if pd.notna(nps) and nps >= 9:
+        parts.append(f"Promoter NPS {int(round(nps))}")
+    return "; ".join(parts) if parts else "No strong positive signal available"
+
+
+def risk_factors(row):
+    parts = []
+    gap = num(row, "Days Since Last Completed Call")
+    if pd.isna(gap): parts.append("No completed-call date available")
+    elif gap > 90: parts.append(f"Last completed call {int(round(gap))} days ago")
+    elif gap > 60: parts.append(f"Call gap {int(round(gap))} days")
+    devices = num(row, "Vital Devices Available", num(row, "Active Device Count", 0))
+    vitals = num(row, "Total Relevant Vitals - Last 30 Days", 0)
+    if devices > 0 and vitals == 0: parts.append("Device available but no recent vitals")
+    pending_calls = num(row, "System Renewal Calls Remaining", 0)
+    if pending_calls > 0: parts.append(f"{int(round(pending_calls))} renewal call(s) pending")
+    return "; ".join(parts) if parts else "No major risk flag"
+
+
+def suggested_pitch(row):
+    name = str(row.get("Patient Name", "patient") or "patient").strip()
+    plan = str(row.get("Current Plan Name", "current plan") or "current plan").strip()
+    logistic = num(row, "Logistic Model Score", 0)
+    guidance = ("Ask for renewal confirmation and next-plan preference." if logistic >= 75 else
+                "Reinforce achieved benefits and resolve objections." if logistic >= 50 else
+                "First understand barriers, affordability and service concerns.")
+    return (f"Discuss renewal with {name}. Highlight {row.get('Positive Highlights', '')}. "
+            f"Position renewal as continuity of {plan}, care-team support, monitoring and further improvement. {guidance}")
+
+
 def prepare_reason_data(df):
     if df.empty:return pd.DataFrame(columns=["_Patient_Key","Reason","Reason Comment","Reason Completion Time"])
     df=clean_df(df); lm={c.lower().strip():c for c in df.columns}
@@ -267,6 +360,11 @@ dp=((devices>0)&(vitals<=0)).astype(float)*15;manual=(base-cp-dp).clip(0,100);lo
 scored=current.copy()
 for f in FACTORS:scored[f"{f} Component Score"]=cc[f].round(1)
 scored["Manual Base Score Before Penalty"]=base.round(1);scored["Call Gap Penalty"]=cp;scored["Device Penalty"]=dp;scored["Manual Renewal Score"]=manual.round(1);scored["Manual Possibility"]=possibility(manual);scored["Logistic Model Score"]=logistic.round(1);scored["Logistic Prediction"]=logistic_label(logistic);scored["Final Renewal Score"]=final.round(1);scored["Final Renewal Possibility"]=possibility(final)
+scored["Caller"] = scored.apply(decide_caller, axis=1)
+scored["Caller Role"] = scored.apply(determine_caller_role, axis=1)
+scored["Positive Highlights"] = scored.apply(positive_highlights, axis=1)
+scored["Risk Factors"] = scored.apply(risk_factors, axis=1)
+scored["Suggested Renewal Pitch"] = scored.apply(suggested_pitch, axis=1)
 scored["_Patient_Key"]=normalize_identifier(scored.get("Identifier",pd.Series("",index=scored.index)));scored=scored.merge(reasons,on="_Patient_Key",how="left");scored["Reason"]=scored["Reason"].fillna("").astype(str).str.strip()
 sys=first_numeric(scored,["System Renewal Calls Completed","Renewal Calls Completed"]);statuses=[c for c in ["Renewal Call 1 Status","Renewal Call 2 Status","Renewal Call 3 Status"] if c in scored.columns];fallback=sum(scored[c].fillna("").astype(str).str.upper().eq("COMPLETED").astype(int) for c in statuses) if statuses else pd.Series(0,index=scored.index)
 scored["Renewal Calls Completed Count"]=sys.fillna(fallback).fillna(0).astype(int)
@@ -296,9 +394,18 @@ with t3:
     if d.empty:st.info("No patient found")
     else:
         choices=d.apply(lambda r:f"{r.get('Identifier','')} | {r.get('Patient Name','')} | {r.get('Escalation Status','')}",axis=1).tolist();choice=st.selectbox("Select patient",choices);row=d.iloc[choices.index(choice)]
-        a,b,c,e=st.columns(4);a.metric("Manual",row.get("Manual Renewal Score"));b.metric("Logistic",row.get("Logistic Model Score"));c.metric("Final",row.get("Final Renewal Score"));e.metric("Escalation",row.get("Escalation Status"))
-        fields=["Manual Base Score Before Penalty","Call Gap Penalty","Device Penalty","Manual Renewal Score","Logistic Model Score","Final Renewal Score"]+[f"{x} Component Score" for x in FACTORS]
-        st.dataframe(pd.DataFrame({"Field":fields,"Value":[row.get(x,"") for x in fields]}),use_container_width=True,hide_index=True)
+        a,b,c,e,f=st.columns(5);a.metric("Manual",row.get("Manual Renewal Score"));b.metric("Logistic",row.get("Logistic Model Score"));c.metric("Final",row.get("Final Renewal Score"));e.metric("Caller",row.get("Caller",""));f.metric("Escalation",row.get("Escalation Status"))
+        st.markdown("### 📞 Renewal Call Talking Points")
+        st.markdown(f"**Positive Highlights:** {row.get('Positive Highlights','')}")
+        st.markdown(f"**Risk Factors:** {row.get('Risk Factors','')}")
+        st.info(f"💬 **Suggested Renewal Pitch:** {row.get('Suggested Renewal Pitch','')}")
+        st.markdown("### 📋 Patient context")
+        context_fields=["Source","Caller","Caller Role","HC Name","LCM Name","Current Plan Name","Subscription Start Date","Subscription End Date","Days Remaining","System Renewal Calls Completed","System Renewal Calls Remaining","Renewal Status","Latest NPS Score","Latest NPS Category","Latest NPS Comments","Vital Engagement Status","Total Relevant Vitals - Last 30 Days","Weight Trend","Weight Reduction (kg)","SBP Trend","SBP Reduction from Initial","LDL Trend","LDL Reduction from Initial","HbA1c Trend","HbA1c Reduction from Initial"]
+        context_fields=[x for x in context_fields if x in row.index]
+        st.dataframe(pd.DataFrame({"Field":context_fields,"Value":[row.get(x,"") for x in context_fields]}),use_container_width=True,hide_index=True)
+        with st.expander("🧮 Scoring Breakdown",expanded=False):
+            fields=["Manual Base Score Before Penalty","Call Gap Penalty","Device Penalty","Manual Renewal Score","Logistic Model Score","Final Renewal Score"]+[f"{x} Component Score" for x in FACTORS]
+            st.dataframe(pd.DataFrame({"Field":fields,"Value":[row.get(x,"") for x in fields]}),use_container_width=True,hide_index=True)
         pk=normalize_identifier(pd.Series([row.get("Identifier","")])).iloc[0];pe=escalations[escalations["_Patient_Key"].eq(pk)].copy()
         with st.expander(f"🚨 Escalations ({len(pe)})",expanded=not pe.empty):
             if pe.empty:st.info("No escalation record found")
