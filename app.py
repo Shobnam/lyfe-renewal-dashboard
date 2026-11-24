@@ -400,9 +400,77 @@ with t3:
         st.markdown(f"**Risk Factors:** {row.get('Risk Factors','')}")
         st.info(f"💬 **Suggested Renewal Pitch:** {row.get('Suggested Renewal Pitch','')}")
         st.markdown("### 📋 Patient context")
-        context_fields=["Source","Caller","Caller Role","HC Name","LCM Name","Current Plan Name","Subscription Start Date","Subscription End Date","Days Remaining","System Renewal Calls Completed","System Renewal Calls Remaining","Renewal Status","Latest NPS Score","Latest NPS Category","Latest NPS Comments","Vital Engagement Status","Total Relevant Vitals - Last 30 Days","Weight Trend","Weight Reduction (kg)","SBP Trend","SBP Reduction from Initial","LDL Trend","LDL Reduction from Initial","HbA1c Trend","HbA1c Reduction from Initial"]
-        context_fields=[x for x in context_fields if x in row.index]
-        st.dataframe(pd.DataFrame({"Field":context_fields,"Value":[row.get(x,"") for x in context_fields]}),use_container_width=True,hide_index=True)
+        detail_sections = {
+            "📅 Plan & Renewal": [
+                "Source", "Email", "Caller", "Caller Role", "HC Name", "LCM Name",
+                "Current Plan Name", "Current Plan Duration", "Current Plan Price",
+                "Subscription Start Date", "Subscription End Date", "Days Remaining",
+                "Days to / Since Plan Expiry", "Renewal Status", "Actual Renewal Date",
+                "Next Plan Name", "Next Plan Start Date", "Next Plan End Date",
+                "System Renewal Calls Scheduled", "System Renewal Calls Completed",
+                "System Renewal Calls Remaining", "System Renewal Follow Up Status",
+                "Renewal Call 1 Date", "Renewal Call 1 Status", "Renewal Call 1 Subject", "Renewal Call 1 Role",
+                "Renewal Call 2 Date", "Renewal Call 2 Status", "Renewal Call 2 Subject", "Renewal Call 2 Role",
+                "Renewal Call 3 Date", "Renewal Call 3 Status", "Renewal Call 3 Subject", "Renewal Call 3 Role",
+                "Last Renewal Call Date", "Last Completed Renewal Call Date",
+            ],
+            "📞 Service Calls": [
+                "Last Completed Call Date", "Days Since Last Completed Call",
+                "LCM Calls Scheduled", "LCM Calls Completed", "LCM Completion %",
+                "HC Calls Scheduled", "HC Calls Completed", "HC Completion %",
+                "CT Calls Scheduled", "CT Calls Completed", "CT Completion %", "CT Physio Name",
+                "Psychotherapist Sessions Scheduled", "Psychotherapist Sessions Completed",
+                "Psychotherapist Completion %", "Psychotherapist Engagement",
+            ],
+            "⚖️ Weight Details": [
+                "Initial Active Weight (kg)", "Initial Active Weight Date", "Initial Active Weight Status",
+                "Latest Active Weight (kg)", "Latest Active Weight Date", "Latest Active Weight Status",
+                "Total Active Weight Readings - Subscription", "Weight Reduction (kg)",
+                "Weight Change %", "Weight Trend",
+            ],
+            "🩺 SBP Details": [
+                "Initial SBP", "Initial SBP Date", "Initial SBP Status",
+                "Current SBP", "Current SBP Date", "Current SBP Status",
+                "SBP Reduction from Initial", "SBP Change %", "SBP Trend",
+            ],
+            "🧪 LDL Details": [
+                "Initial LDL", "Initial LDL Date", "Current LDL", "Current LDL Date",
+                "LDL Reduction from Initial", "LDL Change %", "LDL Trend",
+            ],
+            "🩸 HbA1c Details": [
+                "Initial HbA1c", "Initial HbA1c Date", "Current HbA1c", "Current HbA1c Date",
+                "HbA1c Reduction from Initial", "HbA1c Change %", "HbA1c Trend",
+            ],
+            "📟 Devices & Vitals": [
+                "Active Device Count", "Active Devices", "BP Monitor Available", "Weight Scale Available",
+                "Glucometer Available", "Oximeter Available", "BP Readings - Last 30 Days",
+                "Weight Readings - Last 30 Days", "Glucose Readings - Last 30 Days",
+                "SpO2 Readings - Last 30 Days", "Heart Rate Readings - Last 30 Days",
+                "Total Relevant Vitals - Last 30 Days", "Last Vital Date", "Days Since Last Vital",
+                "Vital Devices Available", "Devices With Recent Vitals", "Device Vital Coverage %",
+                "Vital Engagement Status",
+            ],
+            "⭐ NPS & Feedback": [
+                "Latest NPS Score", "Latest NPS Category", "Latest NPS Date",
+                "Latest NPS Comments", "Latest NPS Data Source", "Average NPS Score",
+                "Total NPS Responses", "Promoter Responses", "Passive Responses", "Detractor Responses",
+                "Overall Service Feedback", "Health Coach Feedback", "LCM Feedback",
+                "Cardio Therapy Feedback", "Meditation Feedback", "Monitoring Devices Feedback",
+                "Lyfe App Feedback", "Alert Management Feedback",
+            ],
+        }
+        for section_name, section_fields in detail_sections.items():
+            visible_fields = [field for field in section_fields if field in row.index]
+            if visible_fields:
+                with st.expander(section_name, expanded=(section_name == "📅 Plan & Renewal")):
+                    st.dataframe(
+                        pd.DataFrame({
+                            "Field": visible_fields,
+                            "Value": [row.get(field, "") for field in visible_fields],
+                        }),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
         with st.expander("🧮 Scoring Breakdown",expanded=False):
             fields=["Manual Base Score Before Penalty","Call Gap Penalty","Device Penalty","Manual Renewal Score","Logistic Model Score","Final Renewal Score"]+[f"{x} Component Score" for x in FACTORS]
             st.dataframe(pd.DataFrame({"Field":fields,"Value":[row.get(x,"") for x in fields]}),use_container_width=True,hide_index=True)
