@@ -165,6 +165,67 @@ def prepare_escalation(df,source):
     return out[out["_Patient_Key"].ne("")][cols]
 
 
+
+def is_valid_email(value):
+    parsed = parseaddr(str(value or "").strip())[1]
+    return bool(parsed and "@" in parsed and "." in parsed.split("@")[-1])
+
+
+def parse_email_list(value):
+    parts = str(value or "").replace(";", ",").split(",")
+    return list(dict.fromkeys(x.strip() for x in parts if is_valid_email(x.strip())))
+
+
+def connect_sendgrid(api_key):
+    server = smtplib.SMTP(SMTP_SERVER, SMTP_PORT, timeout=60)
+    server.ehlo(); server.starttls(); server.ehlo()
+    server.login("apikey", api_key.strip())
+    return server
+
+
+def renewal_report_excel(call_df, pending_df, received_df):
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        call_df.drop(columns=["_Patient_Key"], errors="ignore").to_excel(writer, sheet_name="Renewal_Call_List", index=False)
+        pending_df.drop(columns=["_Patient_Key"], errors="ignore").to_excel(writer, sheet_name="Reason_Pending", index=False)
+        received_df.drop(columns=["_Patient_Key"], errors="ignore").to_excel(writer, sheet_name="Reason_Received", index=False)
+        for ws in writer.book.worksheets:
+            ws.freeze_panes = "A2"
+            ws.auto_filter.ref = ws.dimensions
+    return output.getvalue()
+
+
+def build_report_html(call_df, pending_df, received_df, renewed_count):
+    high = int(call_df.get("Final Renewal Possibility", pd.Series(dtype=str)).eq("HIGH").sum())
+    moderate = int(call_df.get("Final Renewal Possibility", pd.Series(dtype=str)).eq("MODERATE").sum())
+    low = int(call_df.get("Final Renewal Possibility", pd.Series(dtype=str)).eq("LOW").sum())
+    escalation = int(call_df.get("Escalation Status", pd.Series(dtype=str)).eq("Escalation").sum())
+    generated = datetime.now().strftime("%d-%b-%Y %I:%M %p")
+    return f"""<html><body style='font-family:Arial;background:#f5f7fb;padding:20px'>
+    <div style='background:white;padding:24px;border-radius:12px;max-width:900px;margin:auto'>
+    <h2 style='color:#b4235a'>Lyfe Renewal Intelligence Report</h2><p>Generated: {generated}</p>
+    <table cellpadding='10' cellspacing='5'><tr><td><b>{len(call_df)}</b><br>Calling List</td><td><b>{renewed_count}</b><br>Renewed</td><td><b>{high}</b><br>High</td><td><b>{moderate}</b><br>Moderate</td><td><b>{low}</b><br>Low</td><td><b>{escalation}</b><br>Escalation</td><td><b>{len(pending_df)}</b><br>Reason Pending</td></tr></table>
+    <p><b>Action required:</b> {len(pending_df)} patient(s) have at least 3 completed renewal calls and no non-renewal reason.</p>
+    <p>The attached Excel contains Renewal Call List, Reason Pending, and Reason Received sheets.</p>
+    <p>Regards,<br>Lyfe Renewal Intelligence</p></div></body></html>"""
+
+
+def create_report_email(sender, recipients, cc_list, bcc_list, subject, html_body, attachment_bytes, attachment_name):
+    message = MIMEMultipart("mixed")
+    message["From"] = formataddr(("Lyfe Renewal Intelligence", sender))
+    message["To"] = ", ".join(recipients)
+    if cc_list: message["Cc"] = ", ".join(cc_list)
+    if bcc_list: message["Bcc"] = ", ".join(bcc_list)
+    message["Subject"] = subject
+    alternative = MIMEMultipart("alternative")
+    alternative.attach(MIMEText("The detailed renewal report is attached.", "plain", "utf-8"))
+    alternative.attach(MIMEText(html_body, "html", "utf-8"))
+    message.attach(alternative)
+    attachment = MIMEApplication(attachment_bytes, _subtype="vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    attachment.add_header("Content-Disposition", "attachment", filename=attachment_name)
+    message.attach(attachment)
+    return message
+
 TODAY=date.today().isoformat()
 for k,v in {"uploaded_excel_bytes":None,"uploaded_excel_name":None,"uploaded_excel_date":None}.items():
     if k not in st.session_state:st.session_state[k]=v
@@ -222,7 +283,7 @@ if q:filtered=filtered[filtered.get("Identifier","").astype(str).str.lower().str
 
 m=st.columns(6);m[0].metric("Call List",len(filtered));m[1].metric("High",int(filtered["Final Renewal Possibility"].eq("HIGH").sum()));m[2].metric("Moderate",int(filtered["Final Renewal Possibility"].eq("MODERATE").sum()));m[3].metric("Low",int(filtered["Final Renewal Possibility"].eq("LOW").sum()));m[4].metric("Escalation",int(filtered["Escalation Status"].eq("Escalation").sum()));m[5].metric("No Escalation",int(filtered["Escalation Status"].eq("No Escalation").sum()))
 
-t1,t2,t3,t4,t5=st.tabs(["📞 Renewal Call List","⏳ Reason Pending","👤 Patient Drill-down","🧠 Logistic Model","📊 Component Scores"])
+t1,t2,t3,t4,t5,t6=st.tabs(["📞 Renewal Call List","⏳ Reason Pending","👤 Patient Drill-down","🧠 Logistic Model","📊 Component Scores","✉️ Email Report"])
 with t1:
     st.dataframe(filtered.sort_values("Final Renewal Score",ascending=False),use_container_width=True,hide_index=True,height=620)
     st.download_button("Download CSV",filtered.drop(columns=["_Patient_Key"],errors="ignore").to_csv(index=False).encode("utf-8-sig"),"renewal_call_list.csv")
@@ -246,5 +307,57 @@ with t4:
     coef=pd.DataFrame({"Feature":["Intercept"]+MODEL_FEATURES,"Coefficient":model["coefficients"],"Mean":[np.nan]+list(model["means"]),"SD":[np.nan]+list(model["sds"])});st.write(f"Rows: {model['training_rows']} | Renewed: {model['renewed_rows']} | Not renewed: {model['not_renewed_rows']}");st.dataframe(coef,use_container_width=True,hide_index=True)
 with t5:
     cv=cc.round(1);cv.insert(0,"Identifier",current.get("Identifier",pd.Series("",index=current.index)));cv.insert(1,"Patient Name",current.get("Patient Name",pd.Series("",index=current.index)));st.dataframe(cv,use_container_width=True,hide_index=True)
+
+with t6:
+    st.subheader("✉️ Send Renewal Intelligence Report")
+    renewed_count = int((~notrenewed).sum())
+    report_html = build_report_html(call_list, pending, received, renewed_count)
+    report_attachment = renewal_report_excel(call_list, pending, received)
+    p1,p2,p3,p4,p5=st.columns(5)
+    p1.metric("Calling List",len(call_list));p2.metric("Renewed",renewed_count)
+    p3.metric("High",int(call_list["Final Renewal Possibility"].eq("HIGH").sum()))
+    p4.metric("Escalation",int(call_list["Escalation Status"].eq("Escalation").sum()))
+    p5.metric("Reason Pending",len(pending))
+    with st.expander("📧 Report Preview",expanded=True):
+        st.components.v1.html(report_html,height=500,scrolling=True)
+    left,right=st.columns(2)
+    with left:
+        report_sender=st.text_input("Verified Sender Email",value=DEFAULT_REPORT_SENDER,key="report_sender").strip()
+        report_to=st.text_input("To",value=DEFAULT_REPORT_RECIPIENTS,key="report_to")
+        report_cc=st.text_input("CC (optional)",value="",key="report_cc")
+        report_bcc=st.text_input("BCC",value=DEFAULT_REPORT_BCC,key="report_bcc")
+    with right:
+        default_subject=f"Lyfe Renewal Report | {renewed_count} Renewed | {len(call_list)} Calling | {len(pending)} Reason Pending | {datetime.now().strftime('%d-%b-%Y')}"
+        report_subject=st.text_input("Subject",value=default_subject,key="report_subject")
+        try: secret_key=st.secrets.get("SENDGRID_API_KEY","")
+        except Exception: secret_key=""
+        report_api_key=st.text_input("SendGrid API Key",value=secret_key,type="password",key="report_sendgrid_key",help="Best practice: save SENDGRID_API_KEY in Streamlit Secrets.")
+        test_connection=st.button("🔐 Test SendGrid Connection",use_container_width=True,key="test_sendgrid")
+    if test_connection:
+        server=None
+        try:
+            if not is_valid_email(report_sender): raise ValueError("Verified Sender Email is invalid.")
+            if not report_api_key.strip(): raise ValueError("SendGrid API Key is required.")
+            server=connect_sendgrid(report_api_key);st.success("✅ SendGrid connection successful.")
+        except Exception as exc: st.error(f"❌ SendGrid connection failed: {exc}")
+        finally:
+            if server:
+                try: server.quit()
+                except Exception: pass
+    recipients=parse_email_list(report_to);cc_list=parse_email_list(report_cc);bcc_list=parse_email_list(report_bcc)
+    confirmation=st.checkbox(f"I confirm this report should be sent to {len(recipients)} recipient(s).",key="confirm_report")
+    send_report=st.button("🚀 Send Renewal Report",type="primary",use_container_width=True,disabled=(not confirmation or not recipients or not report_api_key.strip() or not is_valid_email(report_sender)),key="send_report")
+    if send_report:
+        server=None
+        try:
+            message=create_report_email(report_sender,recipients,cc_list,bcc_list,report_subject.strip() or default_subject,report_html,report_attachment,f"lyfe_renewal_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx")
+            server=connect_sendgrid(report_api_key);all_recipients=list(dict.fromkeys(recipients+cc_list+bcc_list));server.sendmail(report_sender,all_recipients,message.as_string())
+            st.success(f"✅ Renewal report sent successfully to {', '.join(recipients)}.")
+        except Exception as exc: st.error("❌ Report could not be sent.");st.code(str(exc))
+        finally:
+            if server:
+                try: server.quit()
+                except Exception: pass
+    st.download_button("📥 Download Same Report Excel",report_attachment,f"lyfe_renewal_report_{datetime.now().strftime('%Y%m%d')}.xlsx","application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",use_container_width=True)
 
 st.info("Manual score uses a fixed 100-point denominator. Missing components receive zero. Final Score = 50% Manual + 50% Logistic.")
