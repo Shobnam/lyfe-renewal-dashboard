@@ -8,6 +8,7 @@ from email.mime.application import MIMEApplication
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.utils import formataddr, parseaddr
+
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -21,22 +22,35 @@ HISTORY_SHEET = "Historical_Renewed_2026"
 OUTCOME_COLUMN = "Renewal Outcome"
 FACTORS = ["LCM", "HC", "CT", "Psychotherapist", "Device/Vitals", "Clinical", "NPS"]
 MODEL_FEATURES = [
-    "LCM Score", "HC Score", "CT Score", "Psychotherapist Score",
-    "Device/Vitals Score", "Clinical Score", "NPS Score",
-    "Days Since Last Completed Call", "Total Relevant Vitals - Last 30 Days",
-    "LCM Calls Completed", "HC Calls Completed", "CT Calls Completed",
-    "Psychotherapist Sessions Completed"
+    "LCM Score",
+    "HC Score",
+    "CT Score",
+    "Psychotherapist Score",
+    "Device/Vitals Score",
+    "Clinical Score",
+    "NPS Score",
+    "Days Since Last Completed Call",
+    "Total Relevant Vitals - Last 30 Days",
+    "LCM Calls Completed",
+    "HC Calls Completed",
+    "CT Calls Completed",
+    "Psychotherapist Sessions Completed",
 ]
 MANUAL_WEIGHTS = {
-    "LCM": 10, "HC": 10, "CT": 20, "Psychotherapist": 15,
-    "Device/Vitals": 15, "Clinical": 20, "NPS": 10
+    "LCM": 10,
+    "HC": 10,
+    "CT": 20,
+    "Psychotherapist": 15,
+    "Device/Vitals": 15,
+    "Clinical": 20,
+    "NPS": 10,
 }
 PENALTIES = {
     "Device Available But No Recent Vitals": 15,
     "Call Gap 31-60 Days": 2,
     "Call Gap 61-90 Days": 5,
     "Call Gap More Than 90 Days": 8,
-    "No Completed Call": 10
+    "No Completed Call": 10,
 }
 HIGH_THRESHOLD, MODERATE_THRESHOLD = 75, 50
 LEARNING_RATE, TRAINING_ITERATIONS, REGULARIZATION = 0.025, 2200, 0.01
@@ -47,13 +61,26 @@ DEFAULT_REPORT_SENDER = "shobnambegum@lupindigitalhealth.com"
 DEFAULT_REPORT_RECIPIENTS = "operationsteam@lupindigitalhealth.com"
 DEFAULT_REPORT_BCC = "shobnambegum@lupindigitalhealth.com"
 DATE_COLUMNS = [
-    "Subscription Start Date", "Subscription End Date", "Actual Renewal Date",
-    "Next Plan Start Date", "Next Plan End Date", "Renewal Call 1 Date",
-    "Renewal Call 2 Date", "Renewal Call 3 Date", "Last Renewal Call Date",
-    "Last Completed Renewal Call Date", "Last Completed Call Date",
-    "Initial Active Weight Date", "Latest Active Weight Date",
-    "Initial SBP Date", "Current SBP Date", "Initial LDL Date",
-    "Current LDL Date", "Initial HbA1c Date", "Current HbA1c Date", "Latest NPS Date"
+    "Subscription Start Date",
+    "Subscription End Date",
+    "Actual Renewal Date",
+    "Next Plan Start Date",
+    "Next Plan End Date",
+    "Renewal Call 1 Date",
+    "Renewal Call 2 Date",
+    "Renewal Call 3 Date",
+    "Last Renewal Call Date",
+    "Last Completed Renewal Call Date",
+    "Last Completed Call Date",
+    "Initial Active Weight Date",
+    "Latest Active Weight Date",
+    "Initial SBP Date",
+    "Current SBP Date",
+    "Initial LDL Date",
+    "Current LDL Date",
+    "Initial HbA1c Date",
+    "Current HbA1c Date",
+    "Latest NPS Date",
 ]
 
 
@@ -83,11 +110,16 @@ def first_numeric(df, names, default=np.nan):
 
 
 def yes_series(df, col):
-    return df[col].astype(str).str.strip().str.upper().isin(["YES", "Y", "TRUE", "1"]) if col in df.columns else pd.Series(False, index=df.index)
+    return (
+        df[col].astype(str).str.strip().str.upper().isin(["YES", "Y", "TRUE", "1"])
+        if col in df.columns
+        else pd.Series(False, index=df.index)
+    )
 
 
 def service_component(df, scheduled, completed, pct, target):
-    sch, comp = numeric_series(df, scheduled, 0).fillna(0), numeric_series(df, completed, 0).fillna(0)
+    sch = numeric_series(df, scheduled, 0).fillna(0)
+    comp = numeric_series(df, completed, 0).fillna(0)
     calculated = pd.Series(np.where(sch > 0, comp / sch * 100, np.nan), index=df.index)
     completion = numeric_series(df, pct).fillna(calculated).clip(0, 100)
     effort = (comp / float(target)).clip(0, 1) * 100
@@ -109,7 +141,9 @@ def build_components(df, historical=False):
     c["LCM"] = service_component(df, "LCM Calls Scheduled", "LCM Calls Completed", "LCM Completion %", 6)
     c["HC"] = service_component(df, "HC Calls Scheduled", "HC Calls Completed", "HC Completion %", 6)
     c["CT"] = service_component(df, "CT Calls Scheduled", "CT Calls Completed", "CT Completion %", 6)
-    c["Psychotherapist"] = service_component(df, "Psychotherapist Sessions Scheduled", "Psychotherapist Sessions Completed", "Psychotherapist Completion %", 4)
+    c["Psychotherapist"] = service_component(
+        df, "Psychotherapist Sessions Scheduled", "Psychotherapist Sessions Completed", "Psychotherapist Completion %", 4
+    )
     available = first_numeric(df, ["Vital Devices Available", "Active Device Count"])
     inferred = (
         yes_series(df, "BP Monitor Available").astype(int)
@@ -138,14 +172,17 @@ def weighted_score(components, weights):
 
 
 def model_features(df, c):
-    cols = [c[x].fillna(0).clip(0, 100) for x in FACTORS] + [
-        first_numeric(df, ["Days Since Last Completed Call", "Days Since Last Completed Call at Plan End"], 180).clip(0, 365),
-        first_numeric(df, ["Total Relevant Vitals - Last 30 Days", "Vital Readings - Last 30 Days of Plan"], 0).clip(0, 500),
-        numeric_series(df, "LCM Calls Completed", 0).fillna(0).clip(0, 50),
-        numeric_series(df, "HC Calls Completed", 0).fillna(0).clip(0, 50),
-        numeric_series(df, "CT Calls Completed", 0).fillna(0).clip(0, 50),
-        numeric_series(df, "Psychotherapist Sessions Completed", 0).fillna(0).clip(0, 50),
-    ]
+    cols = (
+        [c[x].fillna(0).clip(0, 100) for x in FACTORS]
+        + [
+            first_numeric(df, ["Days Since Last Completed Call", "Days Since Last Completed Call at Plan End"], 180).clip(0, 365),
+            first_numeric(df, ["Total Relevant Vitals - Last 30 Days", "Vital Readings - Last 30 Days of Plan"], 0).clip(0, 500),
+            numeric_series(df, "LCM Calls Completed", 0).fillna(0).clip(0, 50),
+            numeric_series(df, "HC Calls Completed", 0).fillna(0).clip(0, 50),
+            numeric_series(df, "CT Calls Completed", 0).fillna(0).clip(0, 50),
+            numeric_series(df, "Psychotherapist Sessions Completed", 0).fillna(0).clip(0, 50),
+        ]
+    )
     return np.column_stack([x.to_numpy(float) for x in cols])
 
 
@@ -184,8 +221,12 @@ def train_logistic(df, c):
         beta[0] -= LEARNING_RATE * e.mean()
         beta[1:] -= LEARNING_RATE * ((xs.T @ e) / len(y) + REGULARIZATION * beta[1:])
     return {
-        "coefficients": beta, "means": mean, "sds": sd,
-        "training_rows": len(y), "renewed_rows": r, "not_renewed_rows": n
+        "coefficients": beta,
+        "means": mean,
+        "sds": sd,
+        "training_rows": len(y),
+        "renewed_rows": r,
+        "not_renewed_rows": n,
     }
 
 
@@ -195,13 +236,17 @@ def predict(df, c, m):
 
 
 def possibility(s):
-    return pd.Series(np.select([s >= 75, s >= 50], ["HIGH", "MODERATE"], default="LOW"), index=s.index)
+    return pd.Series(np.select([s >= HIGH_THRESHOLD, s >= MODERATE_THRESHOLD], ["HIGH", "MODERATE"], default="LOW"), index=s.index)
 
 
 def logistic_label(s):
     return pd.Series(
-        np.select([s >= 75, s >= 50, s >= 30], ["HIGH RENEWAL CHANCE", "MODERATE RENEWAL CHANCE", "LOW RENEWAL CHANCE"], default="VERY LOW RENEWAL CHANCE"),
-        index=s.index
+        np.select(
+            [s >= 75, s >= 50, s >= 30],
+            ["HIGH RENEWAL CHANCE", "MODERATE RENEWAL CHANCE", "LOW RENEWAL CHANCE"],
+            default="VERY LOW RENEWAL CHANCE",
+        ),
+        index=s.index,
     )
 
 
@@ -211,7 +256,6 @@ def num(row, col, default=np.nan):
 
 
 def decide_caller(row):
-    """Choose the caller using the established renewal ownership rules."""
     hc = str(row.get("HC Name", "") or "").strip()
     lcm = str(row.get("LCM Name", "") or "").strip()
     for n in [3, 2, 1]:
@@ -225,8 +269,10 @@ def decide_caller(row):
     if num(row, "Total Relevant Vitals - Last 30 Days", 0) >= HIGH_VITALS_MIN and lcm:
         return lcm
     improvement_cols = [
-        "Weight Reduction (kg)", "SBP Reduction from Initial",
-        "LDL Reduction from Initial", "HbA1c Reduction from Initial"
+        "Weight Reduction (kg)",
+        "SBP Reduction from Initial",
+        "LDL Reduction from Initial",
+        "HbA1c Reduction from Initial",
     ]
     if any(num(row, col, 0) > 0 for col in improvement_cols) and hc:
         return hc
@@ -293,9 +339,11 @@ def suggested_pitch(row):
     plan = str(row.get("Current Plan Name", "current plan") or "current plan").strip()
     logistic = num(row, "Logistic Model Score", 0)
     guidance = (
-        "Ask for renewal confirmation and next-plan preference." if logistic >= 75 else
-        "Reinforce achieved benefits and resolve objections." if logistic >= 50 else
-        "First understand barriers, affordability and service concerns."
+        "Ask for renewal confirmation and next-plan preference."
+        if logistic >= 75
+        else "Reinforce achieved benefits and resolve objections."
+        if logistic >= 50
+        else "First understand barriers, affordability and service concerns."
     )
     return (
         f"Discuss renewal with {name}. Highlight {row.get('Positive Highlights', '')}. "
@@ -315,20 +363,39 @@ def prepare_reason_data(df):
         return pd.DataFrame(columns=["_Patient_Key", "Reason", "Reason Comment", "Reason Completion Time"])
     cm = pick(["comment", "comments", "remark", "remarks"])
     tm = pick(["completion time", "completed time", "response time", "submitted at"])
-    out = pd.DataFrame({
-        "_Patient_Key": normalize_identifier(df[p]),
-        "Reason": df[r].fillna("").astype(str).str.strip(),
-        "Reason Comment": df[cm].fillna("").astype(str).str.strip() if cm else "",
-        "Reason Completion Time": pd.to_datetime(df[tm], errors="coerce") if tm else pd.NaT
-    })
-    return out[out["_Patient_Key"].ne("")].sort_values("Reason Completion Time", na_position="first").drop_duplicates("_Patient_Key", keep="last")
+    out = pd.DataFrame(
+        {
+            "_Patient_Key": normalize_identifier(df[p]),
+            "Reason": df[r].fillna("").astype(str).str.strip(),
+            "Reason Comment": df[cm].fillna("").astype(str).str.strip() if cm else "",
+            "Reason Completion Time": pd.to_datetime(df[tm], errors="coerce") if tm else pd.NaT,
+        }
+    )
+    return (
+        out[out["_Patient_Key"].ne("")]
+        .sort_values("Reason Completion Time", na_position="first")
+        .drop_duplicates("_Patient_Key", keep="last")
+    )
 
 
 def prepare_escalation(df, source):
     cols = [
-        "_Patient_Key", "Escalation Source", "Escalation Date", "Owner", "Team",
-        "Bucket", "Sub-Bucket", "Issue Type", "Type Of Issue", "Findings",
-        "Ops Analysis", "Escalation Raised By", "Action Status", "Status", "LCM", "HC"
+        "_Patient_Key",
+        "Escalation Source",
+        "Escalation Date",
+        "Owner",
+        "Team",
+        "Bucket",
+        "Sub-Bucket",
+        "Issue Type",
+        "Type Of Issue",
+        "Findings",
+        "Ops Analysis",
+        "Escalation Raised By",
+        "Action Status",
+        "Status",
+        "LCM",
+        "HC",
     ]
     if df.empty:
         return pd.DataFrame(columns=cols)
@@ -344,13 +411,19 @@ def prepare_escalation(df, source):
     d = pick(["Esc_Date", "Esc Date", "Escalation Date", "Date"])
     out["Escalation Date"] = pd.to_datetime(df[d], errors="coerce") if d else pd.NaT
     mapping = {
-        "Owner": ["Owner"], "Team": ["Team"], "Bucket": ["Bucket"],
-        "Sub-Bucket": ["Sub-Bucket", "Sub Bucket"], "Issue Type": ["Issue Type"],
-        "Type Of Issue": ["Type Of Issue"], "Findings": ["Findings", "Finding"],
+        "Owner": ["Owner"],
+        "Team": ["Team"],
+        "Bucket": ["Bucket"],
+        "Sub-Bucket": ["Sub-Bucket", "Sub Bucket"],
+        "Issue Type": ["Issue Type"],
+        "Type Of Issue": ["Type Of Issue"],
+        "Findings": ["Findings", "Finding"],
         "Ops Analysis": ["Ops Analysis", "Ops Analy", "Ops Analy:"],
         "Escalation Raised By": ["Escalation raised by"],
-        "Action Status": ["Action Status"], "Status": ["Status"],
-        "LCM": ["LCM"], "HC": ["HC"]
+        "Action Status": ["Action Status"],
+        "Status": ["Status"],
+        "LCM": ["LCM"],
+        "HC": ["HC"],
     }
     for k, a in mapping.items():
         x = pick(a)
@@ -492,8 +565,222 @@ try:
             reason = t
             break
 
-    # Yahan aapke original code ke neeche wale tabs / filters / sections ka poora code aayega
-    st.success("Data loaded successfully.")
+    current = clean_df(current)
+    history = clean_df(history)
+
+    for df in (current, history):
+        for col in DATE_COLUMNS:
+            if col in df.columns:
+                df[col] = pd.to_datetime(df[col], errors="coerce")
+
+    curr_comp, curr_avail, curr_recent = build_components(current, historical=False)
+    hist_comp, _, _ = build_components(history, historical=True)
+
+    current_manual = weighted_score(curr_comp, MANUAL_WEIGHTS)
+    gap_days = first_numeric(current, ["Days Since Last Completed Call", "Days Since Last Completed Call at Plan End"], 180)
+    penalty_pts = pd.Series(0.0, index=current.index)
+    penalty_pts += np.where((curr_avail > 0) & (curr_recent == 0), PENALTIES["Device Available But No Recent Vitals"], 0.0)
+    penalty_pts += np.where(gap_days.isna(), PENALTIES["No Completed Call"], 0.0)
+    penalty_pts += np.where(gap_days.notna() & (gap_days > 90), PENALTIES["Call Gap More Than 90 Days"], 0.0)
+    penalty_pts += np.where(gap_days.notna() & (gap_days > 60) & (gap_days <= 90), PENALTIES["Call Gap 61-90 Days"], 0.0)
+    penalty_pts += np.where(gap_days.notna() & (gap_days > 30) & (gap_days <= 60), PENALTIES["Call Gap 31-60 Days"], 0.0)
+    manual_score = (current_manual - penalty_pts).clip(0, 100)
+
+    model = train_logistic(history, hist_comp)
+    logistic_score = predict(current, curr_comp, model)
+    final_score = (manual_score * MANUAL_FINAL_WEIGHT + logistic_score * LOGISTIC_FINAL_WEIGHT).clip(0, 100)
+
+    with st.expander("📈 Logistic Regression Model Summary"):
+        st.write(
+            {
+                "Training Rows": model["training_rows"],
+                "Renewed Rows": model["renewed_rows"],
+                "Not Renewed Rows": model["not_renewed_rows"],
+                "Intercept": round(float(model["coefficients"][0]), 4),
+            }
+        )
+        coef_df = pd.DataFrame(
+            {
+                "Feature": MODEL_FEATURES[: len(model["coefficients"]) - 1],
+                "Coefficient": np.round(model["coefficients"][1:], 4),
+            }
+        )
+        st.dataframe(coef_df, use_container_width=True)
+
+    id_col = next((c for c in ["Patient ID", "Patient Id", "Identifier", "Patient Identifier"] if c in current.columns), None)
+    call_df = current.copy()
+    if id_col:
+        call_df["_Patient_Key"] = normalize_identifier(call_df[id_col])
+    call_df["Manual Score"] = manual_score.round(1)
+    call_df["Logistic Model Score"] = logistic_score.round(1)
+    call_df["Final Renewal Score"] = final_score.round(1)
+    call_df["Final Renewal Possibility"] = possibility(final_score)
+    call_df["Logistic Chance Label"] = logistic_label(logistic_score)
+    call_df["Caller"] = call_df.apply(decide_caller, axis=1)
+    call_df["Caller Role"] = call_df.apply(determine_caller_role, axis=1)
+    call_df["Positive Highlights"] = call_df.apply(positive_highlights, axis=1)
+    call_df["Risk Factors"] = call_df.apply(risk_factors, axis=1)
+    call_df["Suggested Pitch"] = call_df.apply(suggested_pitch, axis=1)
+
+    esc_df = pd.concat(
+        [prepare_escalation(whats, "WhatsApp"), prepare_escalation(mail, "Email")],
+        ignore_index=True,
+    )
+    if "_Patient_Key" in call_df.columns and not esc_df.empty:
+        esc_keys = set(esc_df["_Patient_Key"])
+        call_df["Escalation Status"] = np.where(call_df["_Patient_Key"].isin(esc_keys), "Escalation", "Normal")
+    else:
+        call_df["Escalation Status"] = "Normal"
+
+    reason_df = prepare_reason_data(reason)
+    if "_Patient_Key" in call_df.columns and not reason_df.empty:
+        call_df = call_df.merge(reason_df, on="_Patient_Key", how="left")
+    else:
+        call_df["Reason"] = ""
+        call_df["Reason Comment"] = ""
+        call_df["Reason Completion Time"] = pd.NaT
+
+    completed_calls = (
+        numeric_series(call_df, "LCM Calls Completed", 0).fillna(0)
+        + numeric_series(call_df, "HC Calls Completed", 0).fillna(0)
+        + numeric_series(call_df, "CT Calls Completed", 0).fillna(0)
+    )
+    has_reason = call_df["Reason"].fillna("").astype(str).str.strip().ne("")
+    pending_df = call_df[(completed_calls >= 3) & (~has_reason)].copy()
+    received_df = call_df[has_reason].copy()
+
+    renewed_count = int(renewal_outcome(history).eq(1).sum())
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Calling List", len(call_df))
+    m2.metric("High Possibility", int(call_df["Final Renewal Possibility"].eq("HIGH").sum()))
+    m3.metric("Escalations", int(call_df["Escalation Status"].eq("Escalation").sum()))
+    m4.metric("Reason Pending (≥3 Calls)", len(pending_df))
+
+    st.divider()
+    st.subheader("🔍 Caller & Renewal Filters")
+    f1, f2, f3, f4 = st.columns(4)
+    callers = ["All"] + sorted(call_df["Caller"].dropna().astype(str).unique().tolist())
+    roles = ["All"] + sorted(call_df["Caller Role"].dropna().astype(str).unique().tolist())
+    possibilities = ["All", "HIGH", "MODERATE", "LOW"]
+    esc_options = ["All", "Escalation", "Normal"]
+
+    sel_caller = f1.selectbox("Caller", callers)
+    sel_role = f2.selectbox("Caller Role", roles)
+    sel_poss = f3.selectbox("Renewal Possibility", possibilities)
+    sel_esc = f4.selectbox("Escalation Status", esc_options)
+
+    search_q = st.text_input("Search by Patient Name or ID", placeholder="Type name or identifier...")
+
+    filtered_df = call_df.copy()
+    if sel_caller != "All":
+        filtered_df = filtered_df[filtered_df["Caller"].astype(str) == sel_caller]
+    if sel_role != "All":
+        filtered_df = filtered_df[filtered_df["Caller Role"].astype(str) == sel_role]
+    if sel_poss != "All":
+        filtered_df = filtered_df[filtered_df["Final Renewal Possibility"].astype(str) == sel_poss]
+    if sel_esc != "All":
+        filtered_df = filtered_df[filtered_df["Escalation Status"].astype(str) == sel_esc]
+    if search_q.strip():
+        q = search_q.strip().lower()
+        name_s = (
+            filtered_df["Patient Name"].astype(str).str.lower()
+            if "Patient Name" in filtered_df.columns
+            else pd.Series("", index=filtered_df.index)
+        )
+        id_s = (
+            filtered_df[id_col].astype(str).str.lower()
+            if id_col
+            else pd.Series("", index=filtered_df.index)
+        )
+        filtered_df = filtered_df[name_s.str.contains(q, na=False) | id_s.str.contains(q, na=False)]
+
+    st.subheader(f"Final Renewal Call List ({len(filtered_df)} patients)")
+    st.dataframe(filtered_df.drop(columns=["_Patient_Key"], errors="ignore"), use_container_width=True)
+
+    st.divider()
+    st.subheader("🩺 Patient Drill-Down")
+    if not filtered_df.empty:
+        def format_patient_option(idx):
+            row = filtered_df.loc[idx]
+            p_name = str(row.get("Patient Name", "") or "Unknown").strip()
+            p_id = str(row.get(id_col, idx) if id_col else idx).strip()
+            score = row.get("Final Renewal Score", "")
+            return f"{p_id} — {p_name} (Score: {score})"
+
+        selected_idx = st.selectbox(
+            "Select a patient to inspect details",
+            options=filtered_df.index.tolist(),
+            format_func=format_patient_option,
+        )
+        p_row = filtered_df.loc[selected_idx]
+
+        d1, d2, d3, d4 = st.columns(4)
+        d1.metric("Manual Score", p_row.get("Manual Score", "-"))
+        d2.metric("Logistic Model Score", p_row.get("Logistic Model Score", "-"))
+        d3.metric("Final Renewal Score", p_row.get("Final Renewal Score", "-"))
+        d4.metric("Caller", f"{p_row.get('Caller', 'Unassigned')} ({p_row.get('Caller Role', '-')})")
+
+        st.markdown(
+            f"**Possibility:** {p_row.get('Final Renewal Possibility', '-')} | "
+            f"**Logistic Chance:** {p_row.get('Logistic Chance Label', '-')} | "
+            f"**Escalation Status:** {p_row.get('Escalation Status', '-')}"
+        )
+        st.markdown(f"**Positive Highlights:** {p_row.get('Positive Highlights', '-')}")
+        st.markdown(f"**Risk Factors:** {p_row.get('Risk Factors', '-')}")
+        st.info(f"**Suggested Pitch:** {p_row.get('Suggested Pitch', '-')}")
+
+        if "_Patient_Key" in p_row and not esc_df.empty:
+            p_esc = esc_df[esc_df["_Patient_Key"] == p_row["_Patient_Key"]]
+            if not p_esc.empty:
+                st.warning("Escalation Records for this Patient:")
+                st.dataframe(p_esc.drop(columns=["_Patient_Key"], errors="ignore"), use_container_width=True)
+
+        with st.expander("View All Raw Fields for Selected Patient"):
+            st.json({k: (None if pd.isna(v) else str(v)) for k, v in p_row.drop(labels=["_Patient_Key"], errors="ignore").items()})
+    else:
+        st.info("No patients match the selected filters.")
+
+    st.divider()
+    excel_bytes_out = renewal_report_excel(call_df, pending_df, received_df)
+    st.download_button(
+        "⬇️ Download Renewal Report (.xlsx)",
+        data=excel_bytes_out,
+        file_name=f"Lyfe_Renewal_Report_{TODAY}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+    with st.expander("📧 Send Report via SendGrid"):
+        api_key = st.text_input("SendGrid API Key", type="password")
+        sender = st.text_input("From Email", value=DEFAULT_REPORT_SENDER)
+        to_raw = st.text_input("To Emails (comma separated)", value=DEFAULT_REPORT_RECIPIENTS)
+        bcc_raw = st.text_input("BCC Emails (comma separated)", value=DEFAULT_REPORT_BCC)
+        subject = st.text_input("Subject", value=f"Lyfe Renewal Intelligence Report - {TODAY}")
+        if st.button("Send Email"):
+            to_list = parse_email_list(to_raw)
+            bcc_list = parse_email_list(bcc_raw)
+            if not api_key.strip():
+                st.error("Please enter SendGrid API Key.")
+            elif not is_valid_email(sender) or not to_list:
+                st.error("Please enter a valid sender and at least one valid recipient email.")
+            else:
+                html_body = build_report_html(call_df, pending_df, received_df, renewed_count)
+                msg = create_report_email(
+                    sender.strip(),
+                    to_list,
+                    [],
+                    bcc_list,
+                    subject.strip(),
+                    html_body,
+                    excel_bytes_out,
+                    f"Lyfe_Renewal_Report_{TODAY}.xlsx",
+                )
+                server = connect_sendgrid(api_key)
+                try:
+                    server.send_message(msg)
+                finally:
+                    server.quit()
+                st.success("Report email sent successfully.")
 
 except Exception as e:
     st.error(f"Error processing Excel file: {e}")
