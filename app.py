@@ -311,7 +311,7 @@ def build_report_html(call_df, pending_df, received_df, renewed_count, reason_fo
     generated = datetime.now().strftime("%d-%b-%Y %I:%M %p")
     clean_url = str(reason_form_url or "").strip()
     form_block = (
-        f"<p><b>Non-Renewal Reason Form:</b> <a href='{clean_url}' target='_blank'>Please fill the reason form here</a></p>"
+        f"<p><b>Note:</b> For patients with 3 or more completed renewal calls and no recorded non-renewal reason, please <a href='{clean_url}' target='_blank'>kindly click here to fill reason form</a> so non-renewal tracking remains complete and accurate.</p>"
         if clean_url else ""
     )
     return f"""<html><body style='font-family:Arial;background:#f5f7fb;padding:20px'>
@@ -474,8 +474,7 @@ with t2:
     except Exception: default_reason_link = DEFAULT_REASON_FORM_URL
     reason_form_link = st.text_input("📝 Non-Renewal Reason Form Link", value=default_reason_link, key="reason_form_link", placeholder="https://forms.gle/...").strip()
     if reason_form_link:
-        st.markdown(f"[📝 Please fill the reason form here]({reason_form_link})")
-        st.link_button("📝 Please fill the reason form here", reason_form_link)
+        st.markdown(f"**Note:** Please record non-renewal reasons for patients with 3+ completed calls so tracking stays accurate — [kindly click here to fill reason form]({reason_form_link}).")
     st.dataframe(pending, use_container_width=True, hide_index=True)
 with t3:
     mode = st.radio("🚨 Escalation Filter", ["All Patients", "Escalation Patients", "No Escalation Patients"], horizontal=True); d = filtered.copy()
