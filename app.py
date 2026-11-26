@@ -32,6 +32,7 @@ SMTP_SERVER, SMTP_PORT = "smtp.sendgrid.net", 587
 DEFAULT_REPORT_SENDER = "shobnambegum@lupindigitalhealth.com"
 DEFAULT_REPORT_RECIPIENTS = "operationsteam@lupindigitalhealth.com"
 DEFAULT_REPORT_BCC = "shobnambegum@lupindigitalhealth.com"
+DEFAULT_REASON_FORM_URL = "https://forms.cloud.microsoft/Pages/ResponsePage.aspx?id=RHkqmy7ptk2euJiamGJvnSQaDfF4EXtJikgdnif6C3FUQkQyUlNIMU5RWjVJOFRNSUw2QzlBMTBSSC4u"
 DATE_COLUMNS = ["Subscription Start Date", "Subscription End Date", "Actual Renewal Date", "Next Plan Start Date", "Next Plan End Date", "Renewal Call 1 Date", "Renewal Call 2 Date", "Renewal Call 3 Date", "Last Renewal Call Date", "Last Completed Renewal Call Date", "Last Completed Call Date", "Initial Active Weight Date", "Latest Active Weight Date", "Initial SBP Date", "Current SBP Date", "Initial LDL Date", "Current LDL Date", "Initial HbA1c Date", "Current HbA1c Date", "Latest NPS Date"]
 
 
@@ -163,7 +164,6 @@ def decide_caller(row):
     hc = str(row.get("HC Name", "") or "").strip()
     lcm = str(row.get("LCM Name", "") or "").strip()
 
-    # First preference: owner role of the latest completed renewal call.
     for n in [3, 2, 1]:
         status = str(row.get(f"Renewal Call {n} Status", "") or "").strip().upper()
         role = str(row.get(f"Renewal Call {n} Role", "") or "").strip().upper()
@@ -173,11 +173,9 @@ def decide_caller(row):
             if role == "LCM" and lcm:
                 return lcm
 
-    # High recent vital engagement goes to LCM when available.
     if num(row, "Total Relevant Vitals - Last 30 Days", 0) >= HIGH_VITALS_MIN and lcm:
         return lcm
 
-    # Clinical improvement goes to HC when available.
     improvement_cols = [
         "Weight Reduction (kg)",
         "SBP Reduction from Initial",
@@ -305,17 +303,23 @@ def renewal_report_excel(call_df, pending_df, received_df):
     return output.getvalue()
 
 
-def build_report_html(call_df, pending_df, received_df, renewed_count):
+def build_report_html(call_df, pending_df, received_df, renewed_count, reason_form_url=""):
     high = int(call_df.get("Final Renewal Possibility", pd.Series(dtype=str)).eq("HIGH").sum())
     moderate = int(call_df.get("Final Renewal Possibility", pd.Series(dtype=str)).eq("MODERATE").sum())
     low = int(call_df.get("Final Renewal Possibility", pd.Series(dtype=str)).eq("LOW").sum())
     escalation = int(call_df.get("Escalation Status", pd.Series(dtype=str)).eq("Escalation").sum())
     generated = datetime.now().strftime("%d-%b-%Y %I:%M %p")
+    clean_url = str(reason_form_url or "").strip()
+    form_block = (
+        f"<p><b>Non-Renewal Reason Form:</b> <a href='{clean_url}' target='_blank'>Please fill the reason form here</a></p>"
+        if clean_url else ""
+    )
     return f"""<html><body style='font-family:Arial;background:#f5f7fb;padding:20px'>
     <div style='background:white;padding:24px;border-radius:12px;max-width:900px;margin:auto'>
     <h2 style='color:#b4235a'>Lyfe Renewal Intelligence Report</h2><p>Generated: {generated}</p>
     <table cellpadding='10' cellspacing='5'><tr><td><b>{len(call_df)}</b><br>Calling List</td><td><b>{renewed_count}</b><br>Renewed</td><td><b>{high}</b><br>High</td><td><b>{moderate}</b><br>Moderate</td><td><b>{low}</b><br>Low</td><td><b>{escalation}</b><br>Escalation</td><td><b>{len(pending_df)}</b><br>Reason Pending</td></tr></table>
     <p><b>Action required:</b> {len(pending_df)} patient(s) have at least 3 completed renewal calls and no non-renewal reason.</p>
+    {form_block}
     <p>The attached Excel contains Renewal Call List, Reason Pending, and Reason Received sheets.</p>
     <p>Regards,<br>Lyfe Renewal Intelligence</p></div></body></html>"""
 
@@ -337,7 +341,6 @@ def create_report_email(sender, recipients, cc_list, bcc_list, subject, html_bod
     return message
 
 
-# ---------------- Daily upload state (shared across all users for today) ----------------
 TODAY = date.today().isoformat()
 CACHE_DIR = os.path.join(tempfile.gettempdir(), "lyfe_renewal_intelligence_cache")
 os.makedirs(CACHE_DIR, exist_ok=True)
@@ -466,7 +469,14 @@ with t1:
     st.dataframe(filtered.sort_values("Final Renewal Score", ascending=False), use_container_width=True, hide_index=True, height=620)
     st.download_button("Download CSV", filtered.drop(columns=["_Patient_Key"], errors="ignore").to_csv(index=False).encode("utf-8-sig"), "renewal_call_list.csv")
 with t2:
-    st.metric("Reason Pending", len(pending)); st.dataframe(pending, use_container_width=True, hide_index=True)
+    st.metric("Reason Pending", len(pending))
+    try: default_reason_link = st.secrets.get("REASON_FORM_URL", DEFAULT_REASON_FORM_URL)
+    except Exception: default_reason_link = DEFAULT_REASON_FORM_URL
+    reason_form_link = st.text_input("📝 Non-Renewal Reason Form Link", value=default_reason_link, key="reason_form_link", placeholder="https://forms.gle/...").strip()
+    if reason_form_link:
+        st.markdown(f"[📝 Please fill the reason form here]({reason_form_link})")
+        st.link_button("📝 Please fill the reason form here", reason_form_link)
+    st.dataframe(pending, use_container_width=True, hide_index=True)
 with t3:
     mode = st.radio("🚨 Escalation Filter", ["All Patients", "Escalation Patients", "No Escalation Patients"], horizontal=True); d = filtered.copy()
     if mode == "Escalation Patients": d = d[d["Escalation Status"].eq("Escalation")]
@@ -578,7 +588,9 @@ with t5:
 with t6:
     st.subheader("✉️ Send Renewal Intelligence Report")
     renewed_count = int((~notrenewed).sum())
-    report_html = build_report_html(call_list, pending, received, renewed_count)
+    try: active_reason_form_url = st.session_state.get("reason_form_link") or st.secrets.get("REASON_FORM_URL", DEFAULT_REASON_FORM_URL)
+    except Exception: active_reason_form_url = st.session_state.get("reason_form_link") or DEFAULT_REASON_FORM_URL
+    report_html = build_report_html(call_list, pending, received, renewed_count, active_reason_form_url)
     report_attachment = renewal_report_excel(call_list, pending, received)
     p1, p2, p3, p4, p5 = st.columns(5)
     p1.metric("Calling List", len(call_list)); p2.metric("Renewed", renewed_count)
@@ -595,7 +607,10 @@ with t6:
         report_bcc = st.text_input("BCC", value=DEFAULT_REPORT_BCC, key="report_bcc")
     with right:
         default_subject = f"Lyfe Renewal Report | {renewed_count} Renewed | {len(call_list)} Calling | {len(pending)} Reason Pending | {datetime.now().strftime('%d-%b-%Y')}"
-        report_subject = st.text_input("Subject", value=default_subject, key="report_subject")
+        if st.session_state.get("_auto_subject_base") != default_subject:
+            st.session_state["_auto_subject_base"] = default_subject
+            st.session_state["report_subject"] = default_subject
+        report_subject = st.text_input("Subject", key="report_subject")
         try: secret_key = st.secrets.get("SENDGRID_API_KEY", "")
         except Exception: secret_key = ""
         report_api_key = st.text_input("SendGrid API Key", value=secret_key, type="password", key="report_sendgrid_key", help="Best practice: save SENDGRID_API_KEY in Streamlit Secrets.")
