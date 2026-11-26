@@ -410,4 +410,279 @@ def prepare_escalation(df, source):
     out["_Patient_Key"] = normalize_identifier(df[p])
     out["Escalation Source"] = source
     d = pick(["Esc_Date", "Esc Date", "Escalation Date", "Date"])
-    out["Escalation Date"] = pd.to_datetime(df[d], errors="coerce") if d else pd.
+    out["Escalation Date"] = pd.to_datetime(df[d], errors="coerce") if d else pd.NaT
+    mapping = {
+        "Owner": ["Owner"],
+        "Team": ["Team"],
+        "Bucket": ["Bucket"],
+        "Sub-Bucket": ["Sub-Bucket", "Sub Bucket"],
+        "Issue Type": ["Issue Type"],
+        "Type Of Issue": ["Type Of Issue"],
+        "Findings": ["Findings", "Finding"],
+        "Ops Analysis": ["Ops Analysis", "Ops Analy", "Ops Analy:"],
+        "Escalation Raised By": ["Escalation raised by"],
+        "Action Status": ["Action Status"],
+        "Status": ["Status"],
+        "LCM": ["LCM"],
+        "HC": ["HC"],
+    }
+    for k, a in mapping.items():
+        x = pick(a)
+        out[k] = df[x].fillna("").astype(str).str.strip() if x else ""
+    return out[out["_Patient_Key"].ne("")][cols]
+
+
+def is_valid_email(value):
+    parsed = parseaddr(str(value or "").strip())[1]
+    return bool(parsed and "@" in parsed and "." in parsed.split("@")[-1])
+
+
+def parse_email_list(value):
+    parts = str(value or "").replace(";", ",").split(",")
+    return list(dict.fromkeys(x.strip() for x in parts if is_valid_email(x.strip())))
+
+
+def connect_sendgrid(api_key):
+    server = smtplib.SMTP(SMTP_SERVER, SMTP_PORT, timeout=60)
+    server.ehlo()
+    server.starttls()
+    server.ehlo()
+    server.login("apikey", api_key.strip())
+    return server
+
+
+def renewal_report_excel(call_df, pending_df, received_df):
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        call_df.drop(columns=["_Patient_Key"], errors="ignore").to_excel(writer, sheet_name="Renewal_Call_List", index=False)
+        pending_df.drop(columns=["_Patient_Key"], errors="ignore").to_excel(writer, sheet_name="Reason_Pending", index=False)
+        received_df.drop(columns=["_Patient_Key"], errors="ignore").to_excel(writer, sheet_name="Reason_Received", index=False)
+        for ws in writer.book.worksheets:
+            ws.freeze_panes = "A2"
+            ws.auto_filter.ref = ws.dimensions
+    return output.getvalue()
+
+
+def build_report_html(call_df, pending_df, received_df, renewed_count):
+    high = int(call_df.get("Final Renewal Possibility", pd.Series(dtype=str)).eq("HIGH").sum())
+    moderate = int(call_df.get("Final Renewal Possibility", pd.Series(dtype=str)).eq("MODERATE").sum())
+    low = int(call_df.get("Final Renewal Possibility", pd.Series(dtype=str)).eq("LOW").sum())
+    escalation = int(call_df.get("Escalation Status", pd.Series(dtype=str)).eq("Escalation").sum())
+    generated = datetime.now().strftime("%d-%b-%Y %I:%M %p")
+    return f"""<html><body style='font-family:Arial;background:#f5f7fb;padding:20px'>
+<div style='background:white;padding:24px;border-radius:12px;max-width:900px;margin:auto'>
+<h2 style='color:#b4235a'>Lyfe Renewal Intelligence Report</h2><p>Generated: {generated}</p>
+<table cellpadding='10' cellspacing='5'><tr><td><b>{len(call_df)}</b><br>Calling List</td><td><b>{renewed_count}</b><br>Renewed</td><td><b>{high}</b><br>High</td><td><b>{moderate}</b><br>Moderate</td><td><b>{low}</b><br>Low</td><td><b>{escalation}</b><br>Escalation</td><td><b>{len(pending_df)}</b><br>Reason Pending</td></tr></table>
+<p><b>Action required:</b> {len(pending_df)} patient(s) have at least 3 completed renewal calls and no non-renewal reason.</p>
+<p>The attached Excel contains Renewal Call List, Reason Pending, and Reason Received sheets.</p>
+<p>Regards,<br>Lyfe Renewal Intelligence</p></div></body></html>"""
+
+
+def create_report_email(sender, recipients, cc_list, bcc_list, subject, html_body, attachment_bytes, attachment_name):
+    message = MIMEMultipart("mixed")
+    message["From"] = formataddr(("Lyfe Renewal Intelligence", sender))
+    message["To"] = ", ".join(recipients)
+    if cc_list:
+        message["Cc"] = ", ".join(cc_list)
+    if bcc_list:
+        message["Bcc"] = ", ".join(bcc_list)
+    message["Subject"] = subject
+    alternative = MIMEMultipart("alternative")
+    alternative.attach(MIMEText("The detailed renewal report is attached.", "plain", "utf-8"))
+    alternative.attach(MIMEText(html_body, "html", "utf-8"))
+    message.attach(alternative)
+    attachment = MIMEApplication(attachment_bytes, _subtype="vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    attachment.add_header("Content-Disposition", "attachment", filename=attachment_name)
+    message.attach(attachment)
+    return message
+
+
+TODAY = date.today().isoformat()
+TEMP_DIR = os.path.join(tempfile.gettempdir(), "lyfe_renewal_cache")
+os.makedirs(TEMP_DIR, exist_ok=True)
+META_PATH = os.path.join(TEMP_DIR, "upload_meta.json")
+EXCEL_PATH = os.path.join(TEMP_DIR, "daily_patients_data.xlsx")
+
+
+def load_cached_upload():
+    if os.path.exists(META_PATH) and os.path.exists(EXCEL_PATH):
+        try:
+            with open(META_PATH, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+            if meta.get("date") == TODAY:
+                with open(EXCEL_PATH, "rb") as f:
+                    return f.read(), meta.get("name", "patients_data_2026.xlsx")
+        except Exception:
+            pass
+    return None, None
+
+
+def save_cached_upload(file_bytes, filename):
+    with open(EXCEL_PATH, "wb") as f:
+        f.write(file_bytes)
+    with open(META_PATH, "w", encoding="utf-8") as f:
+        json.dump({"date": TODAY, "name": filename}, f)
+
+
+def clear_cached_upload():
+    for path in (META_PATH, EXCEL_PATH):
+        if os.path.exists(path):
+            os.remove(path)
+
+
+excel_bytes, excel_name = load_cached_upload()
+
+if excel_bytes is None:
+    up = st.file_uploader("📂 Upload today's patients_data_2026 Excel", type=["xlsx"])
+    if up is None:
+        st.info(f"Required: {CURRENT_SHEET}, {HISTORY_SHEET}. Optional: Reasons, Escalation Whatsapp, Escalation Mail")
+        st.stop()
+    save_cached_upload(up.getvalue(), up.name)
+    st.rerun()
+else:
+    a, b, c = st.columns([4, 2, 1])
+    a.success(f"📂 {excel_name}")
+    b.info(f"Upload date: {TODAY}")
+    if c.button("🗑️ Remove"):
+        clear_cached_upload()
+        st.rerun()
+
+try:
+    xls = pd.ExcelFile(io.BytesIO(excel_bytes), engine="openpyxl")
+    current = pd.read_excel(xls, CURRENT_SHEET)
+    history = pd.read_excel(xls, HISTORY_SHEET)
+    lookup = {x.lower().strip(): x for x in xls.sheet_names}
+    whats = pd.read_excel(xls, lookup["escalation whatsapp"]) if "escalation whatsapp" in lookup else pd.DataFrame()
+    mail = pd.read_excel(xls, lookup["escalation mail"]) if "escalation mail" in lookup else pd.DataFrame()
+    reason = pd.DataFrame()
+    for sh in xls.sheet_names:
+        if sh.lower().strip() in [CURRENT_SHEET.lower(), HISTORY_SHEET.lower(), "escalation whatsapp", "escalation mail"]:
+            continue
+        t = pd.read_excel(xls, sh)
+        names = {str(c).lower().strip() for c in t.columns}
+        if names.intersection({"patient id", "patientid", "identifier", "patient identifier"}) and names.intersection(
+            {"primary reason", "primary reason for non-renewal", "reason", "renewal reason"}
+        ):
+            reason = t
+            break
+
+    current = clean_df(current)
+    history = clean_df(history)
+
+    for df in (current, history):
+        for col in DATE_COLUMNS:
+            if col in df.columns:
+                df[col] = pd.to_datetime(df[col], errors="coerce")
+
+    curr_comp, curr_avail, curr_recent = build_components(current, historical=False)
+    hist_comp, _, _ = build_components(history, historical=True)
+
+    current_manual = weighted_score(curr_comp, MANUAL_WEIGHTS)
+    gap_days = first_numeric(current, ["Days Since Last Completed Call", "Days Since Last Completed Call at Plan End"], 180)
+    penalty_pts = pd.Series(0.0, index=current.index)
+    penalty_pts += np.where((curr_avail > 0) & (curr_recent == 0), PENALTIES["Device Available But No Recent Vitals"], 0.0)
+    penalty_pts += np.where(gap_days.isna(), PENALTIES["No Completed Call"], 0.0)
+    penalty_pts += np.where(gap_days.notna() & (gap_days > 90), PENALTIES["Call Gap More Than 90 Days"], 0.0)
+    penalty_pts += np.where(gap_days.notna() & (gap_days > 60) & (gap_days <= 90), PENALTIES["Call Gap 61-90 Days"], 0.0)
+    penalty_pts += np.where(gap_days.notna() & (gap_days > 30) & (gap_days <= 60), PENALTIES["Call Gap 31-60 Days"], 0.0)
+    manual_score = (current_manual - penalty_pts).clip(0, 100)
+
+    model = train_logistic(history, hist_comp)
+    logistic_score = predict(current, curr_comp, model)
+    final_score = (manual_score * MANUAL_FINAL_WEIGHT + logistic_score * LOGISTIC_FINAL_WEIGHT).clip(0, 100)
+
+    id_col = next((c for c in ["Patient ID", "Patient Id", "Identifier", "Patient Identifier"] if c in current.columns), None)
+    call_df = current.copy()
+    if id_col:
+        call_df["_Patient_Key"] = normalize_identifier(call_df[id_col])
+    call_df["Manual Score"] = manual_score.round(1)
+    call_df["Logistic Model Score"] = logistic_score.round(1)
+    call_df["Final Renewal Score"] = final_score.round(1)
+    call_df["Final Renewal Possibility"] = possibility(final_score)
+    call_df["Logistic Chance Label"] = logistic_label(logistic_score)
+    call_df["Caller"] = call_df.apply(decide_caller, axis=1)
+    call_df["Caller Role"] = call_df.apply(determine_caller_role, axis=1)
+    call_df["Positive Highlights"] = call_df.apply(positive_highlights, axis=1)
+    call_df["Risk Factors"] = call_df.apply(risk_factors, axis=1)
+    call_df["Suggested Pitch"] = call_df.apply(suggested_pitch, axis=1)
+
+    esc_df = pd.concat(
+        [prepare_escalation(whats, "WhatsApp"), prepare_escalation(mail, "Email")],
+        ignore_index=True,
+    )
+    if "_Patient_Key" in call_df.columns and not esc_df.empty:
+        esc_keys = set(esc_df["_Patient_Key"])
+        call_df["Escalation Status"] = np.where(call_df["_Patient_Key"].isin(esc_keys), "Escalation", "Normal")
+    else:
+        call_df["Escalation Status"] = "Normal"
+
+    reason_df = prepare_reason_data(reason)
+    if "_Patient_Key" in call_df.columns and not reason_df.empty:
+        call_df = call_df.merge(reason_df, on="_Patient_Key", how="left")
+    else:
+        call_df["Reason"] = ""
+        call_df["Reason Comment"] = ""
+        call_df["Reason Completion Time"] = pd.NaT
+
+    completed_calls = (
+        numeric_series(call_df, "LCM Calls Completed", 0).fillna(0)
+        + numeric_series(call_df, "HC Calls Completed", 0).fillna(0)
+        + numeric_series(call_df, "CT Calls Completed", 0).fillna(0)
+    )
+    has_reason = call_df["Reason"].fillna("").astype(str).str.strip().ne("")
+    pending_df = call_df[(completed_calls >= 3) & (~has_reason)].copy()
+    received_df = call_df[has_reason].copy()
+
+    renewed_count = int(renewal_outcome(history).eq(1).sum())
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Calling List", len(call_df))
+    m2.metric("High Possibility", int(call_df["Final Renewal Possibility"].eq("HIGH").sum()))
+    m3.metric("Escalations", int(call_df["Escalation Status"].eq("Escalation").sum()))
+    m4.metric("Reason Pending (≥3 Calls)", len(pending_df))
+
+    st.subheader("Final Renewal Call List")
+    st.dataframe(call_df.drop(columns=["_Patient_Key"], errors="ignore"), use_container_width=True)
+
+    excel_bytes_out = renewal_report_excel(call_df, pending_df, received_df)
+    st.download_button(
+        "⬇️ Download Renewal Report (.xlsx)",
+        data=excel_bytes_out,
+        file_name=f"Lyfe_Renewal_Report_{TODAY}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+    with st.expander("📧 Send Report via SendGrid"):
+        api_key = st.text_input("SendGrid API Key", type="password")
+        sender = st.text_input("From Email", value=DEFAULT_REPORT_SENDER)
+        to_raw = st.text_input("To Emails (comma separated)", value=DEFAULT_REPORT_RECIPIENTS)
+        bcc_raw = st.text_input("BCC Emails (comma separated)", value=DEFAULT_REPORT_BCC)
+        subject = st.text_input("Subject", value=f"Lyfe Renewal Intelligence Report - {TODAY}")
+        if st.button("Send Email"):
+            to_list = parse_email_list(to_raw)
+            bcc_list = parse_email_list(bcc_raw)
+            if not api_key.strip():
+                st.error("Please enter SendGrid API Key.")
+            elif not is_valid_email(sender) or not to_list:
+                st.error("Please enter a valid sender and at least one valid recipient email.")
+            else:
+                html_body = build_report_html(call_df, pending_df, received_df, renewed_count)
+                msg = create_report_email(
+                    sender.strip(),
+                    to_list,
+                    [],
+                    bcc_list,
+                    subject.strip(),
+                    html_body,
+                    excel_bytes_out,
+                    f"Lyfe_Renewal_Report_{TODAY}.xlsx",
+                )
+                server = connect_sendgrid(api_key)
+                try:
+                    server.send_message(msg)
+                finally:
+                    server.quit()
+                st.success("Report email sent successfully.")
+
+except Exception as e:
+    st.error(f"Error processing Excel file: {e}")
