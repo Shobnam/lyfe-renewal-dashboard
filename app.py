@@ -641,9 +641,75 @@ try:
     m3.metric("Escalations", int(call_df["Escalation Status"].eq("Escalation").sum()))
     m4.metric("Reason Pending (≥3 Calls)", len(pending_df))
 
-    st.subheader("Final Renewal Call List")
-    st.dataframe(call_df.drop(columns=["_Patient_Key"], errors="ignore"), use_container_width=True)
+    st.divider()
+    st.subheader("🔍 Filters & Caller View")
+    f1, f2, f3, f4 = st.columns(4)
+    callers = ["All"] + sorted(call_df["Caller"].dropna().astype(str).unique().tolist())
+    roles = ["All"] + sorted(call_df["Caller Role"].dropna().astype(str).unique().tolist())
+    possibilities = ["All", "HIGH", "MODERATE", "LOW"]
+    esc_options = ["All", "Escalation", "Normal"]
 
+    sel_caller = f1.selectbox("Caller", callers)
+    sel_role = f2.selectbox("Caller Role", roles)
+    sel_poss = f3.selectbox("Renewal Possibility", possibilities)
+    sel_esc = f4.selectbox("Escalation Status", esc_options)
+
+    search_q = st.text_input("Search by Patient Name or ID", placeholder="Type name or identifier...")
+
+    filtered_df = call_df.copy()
+    if sel_caller != "All":
+        filtered_df = filtered_df[filtered_df["Caller"].astype(str) == sel_caller]
+    if sel_role != "All":
+        filtered_df = filtered_df[filtered_df["Caller Role"].astype(str) == sel_role]
+    if sel_poss != "All":
+        filtered_df = filtered_df[filtered_df["Final Renewal Possibility"].astype(str) == sel_poss]
+    if sel_esc != "All":
+        filtered_df = filtered_df[filtered_df["Escalation Status"].astype(str) == sel_esc]
+    if search_q.strip():
+        q = search_q.strip().lower()
+        name_s = filtered_df["Patient Name"].astype(str).str.lower() if "Patient Name" in filtered_df.columns else pd.Series("", index=filtered_df.index)
+        id_s = filtered_df[id_col].astype(str).str.lower() if id_col else pd.Series("", index=filtered_df.index)
+        filtered_df = filtered_df[name_s.str.contains(q, na=False) | id_s.str.contains(q, na=False)]
+
+    st.subheader(f"Final Renewal Call List ({len(filtered_df)} patients)")
+    st.dataframe(filtered_df.drop(columns=["_Patient_Key"], errors="ignore"), use_container_width=True)
+
+    st.divider()
+    st.subheader("🩺 Patient Drill-Down")
+    if not filtered_df.empty:
+        def format_patient_option(idx):
+            row = filtered_df.loc[idx]
+            p_name = str(row.get("Patient Name", "") or "Unknown").strip()
+            p_id = str(row.get(id_col, idx) if id_col else idx).strip()
+            score = row.get("Final Renewal Score", "")
+            return f"{p_id} — {p_name} (Score: {score})"
+
+        selected_idx = st.selectbox("Select a patient to inspect details", options=filtered_df.index.tolist(), format_func=format_patient_option)
+        p_row = filtered_df.loc[selected_idx]
+
+        d1, d2, d3, d4 = st.columns(4)
+        d1.metric("Manual Score", p_row.get("Manual Score", "-"))
+        d2.metric("Logistic Model Score", p_row.get("Logistic Model Score", "-"))
+        d3.metric("Final Renewal Score", p_row.get("Final Renewal Score", "-"))
+        d4.metric("Caller", f"{p_row.get('Caller', 'Unassigned')} ({p_row.get('Caller Role', '-')})")
+
+        st.markdown(f"**Possibility:** {p_row.get('Final Renewal Possibility', '-')} | **Logistic Chance:** {p_row.get('Logistic Chance Label', '-')} | **Escalation Status:** {p_row.get('Escalation Status', '-')}")
+        st.markdown(f"**Positive Highlights:** {p_row.get('Positive Highlights', '-')}")
+        st.markdown(f"**Risk Factors:** {p_row.get('Risk Factors', '-')}")
+        st.info(f"**Suggested Pitch:** {p_row.get('Suggested Pitch', '-')}")
+
+        if "_Patient_Key" in p_row and not esc_df.empty:
+            p_esc = esc_df[esc_df["_Patient_Key"] == p_row["_Patient_Key"]]
+            if not p_esc.empty:
+                st.warning("Escalation Records for this Patient:")
+                st.dataframe(p_esc.drop(columns=["_Patient_Key"], errors="ignore"), use_container_width=True)
+
+        with st.expander("View All Raw Fields for Selected Patient"):
+            st.json({k: (None if pd.isna(v) else str(v)) for k, v in p_row.drop(labels=["_Patient_Key"], errors="ignore").items()})
+    else:
+        st.info("No patients match the selected filters.")
+
+    st.divider()
     excel_bytes_out = renewal_report_excel(call_df, pending_df, received_df)
     st.download_button(
         "⬇️ Download Renewal Report (.xlsx)",
