@@ -130,7 +130,22 @@ def train_logistic(df,c):
     mean,sd=X.mean(0),X.std(0); sd[sd<1e-6]=1; xs=(X-mean)/sd; beta=np.zeros(xs.shape[1]+1); sw=np.where(y==1,len(y)/(2*r),len(y)/(2*n))
     for _ in range(TRAINING_ITERATIONS):
         e=(sigmoid(beta[0]+xs@beta[1:])-y)*sw; beta[0]-=LEARNING_RATE*e.mean(); beta[1:]-=LEARNING_RATE*((xs.T@e)/len(y)+REGULARIZATION*beta[1:])
-    return {"coefficients":beta,"means":mean,"sds":sd,"training_rows":len(y),"renewed_rows":r,"not_renewed_rows":n}
+    probs = sigmoid(beta[0] + xs @ beta[1:])
+    preds = (probs >= 0.5).astype(float)
+    accuracy = float((preds == y).mean() * 100)
+    pos_scores = probs[y == 1]
+    neg_scores = probs[y == 0]
+    auc = float((pos_scores[:, None] > neg_scores[None, :]).mean() + 0.5 * (pos_scores[:, None] == neg_scores[None, :]).mean())
+    tp = int(((preds == 1) & (y == 1)).sum())
+    fp = int(((preds == 1) & (y == 0)).sum())
+    fn = int(((preds == 0) & (y == 1)).sum())
+    recall = float(tp / (tp + fn) * 100) if (tp + fn) > 0 else 0.0
+    precision = float(tp / (tp + fp) * 100) if (tp + fp) > 0 else 0.0
+    return {
+        "coefficients":beta,"means":mean,"sds":sd,
+        "training_rows":len(y),"renewed_rows":r,"not_renewed_rows":n,
+        "accuracy":accuracy,"auc":auc,"recall":recall,"precision":precision,
+    }
 
 
 def predict(df,c,m):
@@ -148,6 +163,7 @@ def decide_caller(row):
     hc = str(row.get("HC Name", "") or "").strip()
     lcm = str(row.get("LCM Name", "") or "").strip()
 
+    # First preference: owner role of the latest completed renewal call.
     for n in [3, 2, 1]:
         status = str(row.get(f"Renewal Call {n} Status", "") or "").strip().upper()
         role = str(row.get(f"Renewal Call {n} Role", "") or "").strip().upper()
@@ -157,9 +173,11 @@ def decide_caller(row):
             if role == "LCM" and lcm:
                 return lcm
 
+    # High recent vital engagement goes to LCM when available.
     if num(row, "Total Relevant Vitals - Last 30 Days", 0) >= HIGH_VITALS_MIN and lcm:
         return lcm
 
+    # Clinical improvement goes to HC when available.
     improvement_cols = [
         "Weight Reduction (kg)",
         "SBP Reduction from Initial",
@@ -319,6 +337,7 @@ def create_report_email(sender, recipients, cc_list, bcc_list, subject, html_bod
     return message
 
 
+# ---------------- Daily upload state (shared across all users for today) ----------------
 TODAY = date.today().isoformat()
 CACHE_DIR = os.path.join(tempfile.gettempdir(), "lyfe_renewal_intelligence_cache")
 os.makedirs(CACHE_DIR, exist_ok=True)
@@ -540,7 +559,19 @@ with t3:
             if pe.empty: st.info("No escalation record found")
             else: st.dataframe(pe.drop(columns=["_Patient_Key"]), use_container_width=True, hide_index=True)
 with t4:
-    coef = pd.DataFrame({"Feature": ["Intercept"] + MODEL_FEATURES, "Coefficient": model["coefficients"], "Mean": [np.nan] + list(model["means"]), "SD": [np.nan] + list(model["sds"])}); st.write(f"Rows: {model['training_rows']} | Renewed: {model['renewed_rows']} | Not renewed: {model['not_renewed_rows']}"); st.dataframe(coef, use_container_width=True, hide_index=True)
+    coef = pd.DataFrame({
+        "Feature": ["Intercept"] + MODEL_FEATURES,
+        "Coefficient": model["coefficients"],
+        "Mean": [np.nan] + list(model["means"]),
+        "SD": [np.nan] + list(model["sds"]),
+    })
+    st.write(f"Rows: {model['training_rows']} | Renewed: {model['renewed_rows']} | Not renewed: {model['not_renewed_rows']}")
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("ROC-AUC", f"{model['auc']:.3f}")
+    m2.metric("Accuracy", f"{model['accuracy']:.1f}%")
+    m3.metric("Renewed Recall", f"{model['recall']:.1f}%")
+    m4.metric("Renewed Precision", f"{model['precision']:.1f}%")
+    st.dataframe(coef, use_container_width=True, hide_index=True)
 with t5:
     cv = cc.round(1); cv.insert(0, "Identifier", current.get("Identifier", pd.Series("", index=current.index))); cv.insert(1, "Patient Name", current.get("Patient Name", pd.Series("", index=current.index))); st.dataframe(cv, use_container_width=True, hide_index=True)
 
