@@ -260,8 +260,14 @@ def prepare_reason_data(df):
     return out[out["_Patient_Key"].ne("")].sort_values("Reason Completion Time",na_position="first").drop_duplicates("_Patient_Key",keep="last")
 
 
+def _clean_esc_val(series):
+    s = series.fillna("").astype(str).str.strip()
+    s = s.replace({"0": "", "0.0": "", "nan": "", "NaN": "", "None": "", "NONE": "", "null": "", "NULL": ""})
+    return s.str.strip()
+
+
 def prepare_escalation(df,source):
-    cols=["_Patient_Key","Escalation Source","Escalation Date","Owner","Team","Bucket","Sub-Bucket","Issue Type","Type Of Issue","Findings","Action Status","Ops Analysis","Escalation Raised By","Status","LCM","HC"]
+    cols=["_Patient_Key","Escalation Source","Escalation Date","Owner","Team","Bucket","Sub-Bucket","Issue Type","Type Of Issue","Findings","Voice Details","Action Status","Ops Analysis","Escalation Raised By","Status","LCM","HC"]
     if df.empty:return pd.DataFrame(columns=cols)
     df=clean_df(df); lm={c.lower().strip():c for c in df.columns}; pick=lambda *a:next((lm[x.lower()] for x in a if x.lower() in lm),None)
     p=pick("Patient Id","Patient ID","Identifier","Patient Identifier")
@@ -278,10 +284,10 @@ def prepare_escalation(df,source):
         out["Escalation Date"] = parsed_d
     else:
         out["Escalation Date"] = pd.NaT
-    # WhatsApp sheet: Col G is Findings (voice/call findings), Col H is Ops Analysis
-    # Mail sheet: Col G is Findings, Col I is Action Status
-    findings_col = df.columns[6] if len(df.columns) > 6 and source == "WhatsApp" else None
-    action_status_col = df.columns[8] if len(df.columns) > 8 and source == "Mail" else None
+
+    col_g = df.columns[6] if len(df.columns) > 6 else None
+    col_i = df.columns[8] if len(df.columns) > 8 else None
+
     mapping={
         "Owner":["Owner"],
         "Team":["Team"],
@@ -289,7 +295,8 @@ def prepare_escalation(df,source):
         "Sub-Bucket":["Sub-Bucket","Sub Bucket"],
         "Issue Type":["Issue Type"],
         "Type Of Issue":["Type Of Issue"],
-        "Findings":["Findings","Finding","Voice Issue","Voice"],
+        "Findings":["Findings","Finding"],
+        "Voice Details":["Voice Details","Voice Issue","Voice","Call Issue","Call Details"],
         "Action Status":["Action Status","Action_Status","Action"],
         "Ops Analysis":["Ops Analysis","Ops Analy","Ops Analy:"],
         "Escalation Raised By":["Escalation raised by","Escalation Raised By"],
@@ -299,11 +306,19 @@ def prepare_escalation(df,source):
     }
     for k,a in mapping.items():
         x=pick(*a)
-        if k == "Findings" and findings_col is not None and not x:
-            x = findings_col
-        if k == "Action Status" and action_status_col is not None and not x:
-            x = action_status_col
-        out[k]=df[x].fillna("").astype(str).str.strip() if x else ""
+        if k == "Findings" and not x and col_g is not None:
+            x = col_g
+        if k == "Voice Details":
+            if source == "WhatsApp" and col_g is not None:
+                x = x or col_g
+            else:
+                x = x or pick("Findings","Finding") or col_g
+        if k == "Action Status":
+            if source == "Mail" and col_i is not None:
+                x = x or col_i
+            else:
+                x = x or col_i
+        out[k]=_clean_esc_val(df[x]) if x else ""
     return out[out["_Patient_Key"].ne("")][cols]
 
 
