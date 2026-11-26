@@ -261,16 +261,49 @@ def prepare_reason_data(df):
 
 
 def prepare_escalation(df,source):
-    cols=["_Patient_Key","Escalation Source","Escalation Date","Owner","Team","Bucket","Sub-Bucket","Issue Type","Type Of Issue","Findings","Ops Analysis","Escalation Raised By","Action Status","Status","LCM","HC"]
+    cols=["_Patient_Key","Escalation Source","Escalation Date","Owner","Team","Bucket","Sub-Bucket","Issue Type","Type Of Issue","Findings","Action Status","Ops Analysis","Escalation Raised By","Status","LCM","HC"]
     if df.empty:return pd.DataFrame(columns=cols)
     df=clean_df(df); lm={c.lower().strip():c for c in df.columns}; pick=lambda *a:next((lm[x.lower()] for x in a if x.lower() in lm),None)
     p=pick("Patient Id","Patient ID","Identifier","Patient Identifier")
     if not p:return pd.DataFrame(columns=cols)
     out=pd.DataFrame(index=df.index);out["_Patient_Key"]=normalize_identifier(df[p]);out["Escalation Source"]=source
-    d=pick("Esc_Date","Esc Date","Escalation Date","Date");out["Escalation Date"]=pd.to_datetime(df[d],errors="coerce") if d else pd.NaT
-    mapping={"Owner":["Owner"],"Team":["Team"],"Bucket":["Bucket"],"Sub-Bucket":["Sub-Bucket","Sub Bucket"],"Issue Type":["Issue Type"],"Type Of Issue":["Type Of Issue"],"Findings":["Findings","Finding"],"Ops Analysis":["Ops Analysis","Ops Analy","Ops Analy:"],"Escalation Raised By":["Escalation raised by"],"Action Status":["Action Status"],"Status":["Status"],"LCM":["LCM"],"HC":["HC"]}
+    d=pick("Esc_Date","Esc Date","Escalation Date","Date")
+    if d:
+        raw_d = df[d]
+        parsed_d = pd.to_datetime(raw_d, errors="coerce")
+        num_mask = pd.to_numeric(raw_d, errors="coerce").notna() & raw_d.astype(str).str.strip().str.match(r"^\d+(?:\.0)?$")
+        if num_mask.any():
+            excel_d = pd.to_datetime(pd.to_numeric(raw_d[num_mask], errors="coerce"), unit="D", origin="1899-12-30", errors="coerce")
+            parsed_d.loc[num_mask] = excel_d
+        out["Escalation Date"] = parsed_d
+    else:
+        out["Escalation Date"] = pd.NaT
+    # WhatsApp sheet: Col G is Findings (voice/call findings), Col H is Ops Analysis
+    # Mail sheet: Col G is Findings, Col I is Action Status
+    findings_col = df.columns[6] if len(df.columns) > 6 and source == "WhatsApp" else None
+    action_status_col = df.columns[8] if len(df.columns) > 8 and source == "Mail" else None
+    mapping={
+        "Owner":["Owner"],
+        "Team":["Team"],
+        "Bucket":["Bucket"],
+        "Sub-Bucket":["Sub-Bucket","Sub Bucket"],
+        "Issue Type":["Issue Type"],
+        "Type Of Issue":["Type Of Issue"],
+        "Findings":["Findings","Finding","Voice Issue","Voice"],
+        "Action Status":["Action Status","Action_Status","Action"],
+        "Ops Analysis":["Ops Analysis","Ops Analy","Ops Analy:"],
+        "Escalation Raised By":["Escalation raised by","Escalation Raised By"],
+        "Status":["Status"],
+        "LCM":["LCM"],
+        "HC":["HC"],
+    }
     for k,a in mapping.items():
-        x=pick(*a);out[k]=df[x].fillna("").astype(str).str.strip() if x else ""
+        x=pick(*a)
+        if k == "Findings" and findings_col is not None and not x:
+            x = findings_col
+        if k == "Action Status" and action_status_col is not None and not x:
+            x = action_status_col
+        out[k]=df[x].fillna("").astype(str).str.strip() if x else ""
     return out[out["_Patient_Key"].ne("")][cols]
 
 
